@@ -1,0 +1,10 @@
+.env*
+!.env.example
+.venv/
+__pycache__/
+*.pyc
+/nooie.mp4
+*.mp4
+dist/
+build/
+*.egg-info/

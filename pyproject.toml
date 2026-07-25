@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nooie-tui"
+version = "0.1.0"
+description = "An authorised, self-hosted A/V client for your own Nooie IP cameras"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Louis Goddard", email = "louis@datadesk.eco" }]
+dependencies = [
+    "aiohttp>=3.12,<4",
+    "aiortc>=1.14,<2",
+]
+
+[project.scripts]
+nooie-tui = "nooie_tui.client:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["nooie_tui"]
