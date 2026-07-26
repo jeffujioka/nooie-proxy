@@ -788,16 +788,33 @@ Notes that matter for us:
   https://developer.tuya.com/en/docs/cloud/96c3154b0d?id=Kam7q5rz91dml
   ("get configs of creating webrtc connection" → `p2p_config`).
 
-### the cheapest possible win: sidestep nooie via the generic tuya app
+### the tempting sidestep (pair into the generic tuya app) is very likely closed
 
-Because the device is a tuya device (our `thing.py` already logs into
-`a1.tuyaeu.com` and the app opens `m1.tuyaeu.com:8883`), the highest-leverage
-experiment is to **pair the camera into the generic tuya "smart life" /
-ismartlife.me account** and drive it with go2rtc or tuya-ipc-terminal directly,
-bypassing nooie entirely. caveat: oem apps sometimes bind devices to their own
-`appKey`, so the device may or may not appear in the generic tuya app — this is
-a five-minute real-world test that would either hand us a working stream for
-free or rule the route out.
+The obvious "just use go2rtc" idea is to **pair the camera into the generic tuya
+"smart life" / ismartlife.me account** and drive it with go2rtc or
+tuya-ipc-terminal. after checking the tooling and tuya's own docs, treat this as
+**probably blocked**, worth only a 10-minute empirical confirmation:
+
+- **oem apps and smart life are separate ecosystems and the device is
+  pid-locked.** nooie is a tuya *oem auto-built app*
+  (https://developer.tuya.com/en/docs/iot/appautobuilding?id=K97dki9m38d8w);
+  the device is bound to nooie's product id. re-pairing an oem device into smart
+  life throws tuya's documented "device has been paired previously using a
+  different PID" activation error
+  (https://developer.tuya.com/en/docs/iot-device-dev/Distribution-network-problem-Wi-Fi?id=Kaunggovmyubu).
+- **the reference tools require a genuine tuya account, not an oem one.**
+  go2rtc states outright that **"Smart Life accounts are NOT supported"** (it
+  needs a *tuya smart* account with the cam added) — https://go2rtc.org/internal/tuya/ ;
+  tuya-ipc-terminal likewise only sees cameras already bound to a tuya
+  smart / smart life account and claims no oem-app support.
+- community evidence agrees: the osaio HA thread's "add via tuya app then use
+  the tuya integration" trick **failed** for every user who tried it (gncc
+  P1/T2/XC100/GC3/GC4) — https://community.home-assistant.io/t/osaio-camera-integration/398771 .
+
+so the clean official-tuya toolchain (smart-life binding, iot-core project
+linking, `stream/actions/allocate` rtsp/hls, running go2rtc as-is) is unreachable
+for this camera. its value to us is as a **reference implementation of the
+signalling** (below), not as a runnable shortcut.
 
 ### legacy path worth a cheap probe (probably closed on fw 7.x)
 
@@ -831,18 +848,37 @@ but it fits the pattern above: the camera parses our offer (it addresses the
 `SdpAnswer` back to our `call_id`/`SessionId`) yet declines it, exactly what you
 would expect from an offer arriving on a legacy/oem signalling plane without the
 `moto_id` + mqtt-302 exchange (and, for hevc, the `fmp4Stream` datachannel
-handshake) the current firmware negotiates against.
+handshake) the current firmware negotiates against. because nooie runs tuya's
+stock ipc webrtc stack, `ret:8` almost certainly maps to a **documented tuya
+signalling reject** (bad session/moto id, auth/sign failure, or unsupported
+stream type). grep the tuya reference repos for the `ret` code table:
+`tuya/tuya-rtc-camera-sdk-android`, `tuya/tuya-webrtc-ios-demo`,
+`seydx/tuya-ipc-terminal`, and https://developer.tuya.com/en/docs/iot/webrtc .
+
+### do this first: read the existing pcap
+
+Before writing any code, inspect `nooie-official-login-live.pcap` (and
+`apeman.pcap`) for the **live-view trigger**. one look disambiguates the two
+transports: if the official app negotiates video via mqtt-302 offer/answer, we
+are on the webrtc path (→ recommendation 1); if instead it publishes a
+`cmd`+`url` to make the camera push rtsps, the old reverse-push path survives in
+fw 7.x (→ recommendation 3, which is then the easiest route of all). we already
+have these captures; this is the cheapest, most decisive next action.
 
 ### ranked recommendation
 
-1. **move signalling onto tuya mqtt (protocol 302).** we are already ~90%
+1. **read the pcap to pick the path** (above) — decisive and free.
+2. **move signalling onto tuya mqtt (protocol 302).** we are already ~90%
    connected to the right transport; fetch a webrtc-configs equivalent for
    `moto_id`/ice, then publish the offer as a 302 message and read the answer
    off the topics we already subscribe to, instead of `service.SdpOffer` over
-   the nooie websocket. port the message shapes from go2rtc's tuya module.
-2. **sidestep test:** try adding the camera to the generic tuya smart life /
-   ismartlife.me app and stream it with go2rtc/tuya-ipc-terminal. if it binds,
-   the problem is solved without any of the bespoke crypto in `thing.py`.
-3. **cheap legacy probe:** poke `eu.nooie.com:1883` for a surviving `cmd/url`
-   rtsps-push path.
-4. abandon local rtsp/onvif/firmware — none exist for this hardware.
+   the nooie websocket. port the message shapes and the `ret` code table from
+   go2rtc's / tuya's reference implementations.
+3. **cheap legacy probe:** if the pcap shows a surviving push path, stand up an
+   rtsp/rtsps listener (mediamtx/ffmpeg) and publish the `cmd`+`url` to
+   `eu.nooie.com` mqtt so the camera streams to us — no webrtc at all.
+4. **ruled out — pairing into smart life / official tuya cloud.** oem pid-lock;
+   go2rtc/tuya-ipc-terminal need a genuine tuya account. confirm with a 10-min
+   smart-life pairing attempt, then drop.
+5. abandon local rtsp/onvif/firmware — none exist for this hardware (sibling
+   gncc is anyka ak3918, outside thingino/openipc's ingenic-only support).
