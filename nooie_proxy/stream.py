@@ -22,9 +22,20 @@ from .cloud import Config
 from .env import log
 
 # fragmenting is what makes the mp4 a stream: no trailing index to wait for,
-# so a reader can start mid-file and the writer never has to seek back.
+# so the writer never has to seek back.
 FRAGMENTED = {"movflags": "frag_keyframe+empty_moov+default_base_moof"}
+# a pipe or a file has one reader, present from the first byte, so it can be
+# given the mp4 header once. a network sink is joined whenever the consumer
+# feels like it, and mp4 has no way to catch such a reader up -- mpeg-ts
+# repeats its tables forever, so anyone can tune in at the next keyframe.
+JOINABLE = ("udp", "tcp", "srt", "http", "https")
 ANSWER_TIMEOUT = 30
+
+
+def container(target: str) -> tuple[str, dict[str, str]]:
+    """the muxer that suits how this sink will be read."""
+    scheme = target.partition("://")[0] if "://" in target else ""
+    return ("mpegts", {}) if scheme in JOINABLE else ("mp4", FRAGMENTED)
 
 
 async def stream(config: Config, target: str) -> None:
@@ -63,7 +74,8 @@ async def place_call(
             bundlePolicy=RTCBundlePolicy.MAX_BUNDLE,
         )
     )
-    sink = MediaRecorder(target, format="mp4", options=FRAGMENTED)
+    muxer, options = container(target)
+    sink = MediaRecorder(target, format=muxer, options=options)
     started: asyncio.Task[None] | None = None
     connected = asyncio.Event()
     stopped = asyncio.Event()
