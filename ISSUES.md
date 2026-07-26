@@ -1,65 +1,96 @@
 # Known issues
 
-## #1 — Live view fails: camera answers the WebRTC offer with `Ret=8`
+## #1 — Live view fails when the camera returns `Ret=8`
 
 **Status:** open · **Severity:** blocker
 
-### Summary
+### Verified result
 
-A normal run gets all the way through login, camera discovery, p2p registration,
-session creation, and sending the offer — but when the camera replies, the
-`response.SdpAnswer` carries `Ret=8` and no SDP, so the media handshake never
-starts and nothing is recorded. A working client on the same account and camera
-gets `Ret=0` and an answer SDP in the same spot.
+The independent client successfully completes:
 
-### Steps to reproduce
+1. Nooie credential login and `/v2/user/put` install registration;
+2. camera discovery;
+3. Thing UID token creation and password login;
+4. Thing home/device bootstrap;
+5. MQTT 3.1.1 TLS connection and account-mailbox subscription;
+6. Nooie NAT registration and signalling WebSocket connection;
+7. video-call session creation, compact SDP offer, and both host/relay ICE
+   candidates.
+
+The camera acknowledges the signalling messages, then returns
+`response.SdpAnswer` with `Ret=8` and no answer SDP:
+
+```text
+offer sent; waiting for camera answer
+...
+RuntimeError: camera rejected the call with Ret=8
+```
+
+No peer connection is established and no recording is created. The most recent
+end-to-end check reproduced this with the official Nooie app confirmed absent.
+
+### Reproduce
+
+Configure both the Nooie account and private Thing SDK material as described in
+[README.md](README.md), then run:
 
 ```sh
-cp .env.example .env        # set NOOIE_USERNAME / NOOIE_PASSWORD
+nooie-tui --check-config
 nooie-tui --duration 30
 ```
 
-### Expected
+### What has been ruled out
 
-The camera returns `Ret=0` with a `WebrtcSdp` answer; DTLS-SRTP completes and the
-H.264/audio tracks record to `nooie.mp4`.
+- **Missing Thing login or MQTT presence.** The raw-RSA UID password operation,
+  signed/encrypted mobile API, exact SDK MQTT credentials, TLS broker
+  connection, and account subscription all succeed independently.
+- **A Tuya-MQTT media path.** The successful official capture uses Nooie's
+  `service.SdpOffer` WebSocket path and direct WebRTC media. Its MQTT connection
+  only subscribes twice to the account mailbox; it does not publish an RTC
+  offer, call `tuya.m.rtc.session.init`, or subscribe to a camera topic.
+- **The ordinary post-login bootstrap.** The exact 13-field `/user/put`, Thing
+  home-space list, and home device-list calls all succeed. The account has one
+  Thing home and no Thing device entries.
+- **Offer shape.** After masking only per-session random values, the generated
+  compact offer has no differing keys, types, or static values from a captured
+  accepted offer. The prefix is the required bare-LF `00\n`; CRLF is rejected.
+- **ICE credential lengths and candidates.** All 24 captured official offers
+  use a four-character ufrag and 24-character password. The client now matches
+  both and emits the observed host and relay candidates on media section zero.
+- **Install identity fields.** Controlled tests used the captured stable Nooie
+  request UUID, `phone_code`, Thing UUID, iPad model/platform metadata, locale,
+  login brand, and `/user/put` brand individually and together. `Ret=8`
+  persisted.
+- **Read-only UI/device priming.** Ten of twelve captured UI API calls replayed
+  successfully; the other two returned ordinary endpoint errors. Six captured
+  `atr.get` requests also returned complete camera state. Neither changed the
+  answer, so the extra attribute requests were removed from production.
+- **WebSocket request shape.** The client supplies SocketRocket's HTTPS
+  `Origin` and suppresses aiohttp's extra `Accept`, `Accept-Encoding`, and
+  `User-Agent` headers. The server still acknowledges every message and the
+  camera still returns `Ret=8`.
+- **An unobserved relay bootstrap.** Every external flow in the successful
+  official capture is accounted for. There is no separate port-6116 connection
+  or hidden MQTT publish during live-view setup.
 
-### Actual
+The official diagnostic log contains six accepted live-view sequences. It also
+contains one `Ret=8` answer several minutes after the first accepted sequence,
+with no adjacent new offer or immediate retry, so that occurrence does not
+establish a retry-based fix.
 
-```
-selected IPC007_T6S6A3 (online)
-registered <uid>: wan <ip>:<port> lan <ip>:<port>
-connecting to Nooie signalling WebSocket
-creating Nooie WebRTC session
-offer sent; waiting for camera answer
-...
-RuntimeError: camera rejected the call with Ret=8 (data={"Ret": 8, "SessionId": "...", "call_id": "..."})
-```
+### Remaining boundary
 
-Everything up to the answer succeeds; the camera clearly parses the offer (it
-returns a real `SdpAnswer` addressed to our `call_id`/`SessionId`) but declines
-it with `Ret=8`.
+There is no known unmatched HTTP, MQTT, NAT, WebSocket, SDP, or ICE event before
+the answer. The remaining difference is therefore below the observable request
+sequence: native client state or fingerprinting, or an opaque backend/camera
+admission rule.
 
-### Environment
+A useful next experiment must isolate that boundary—for example, drive the same
+captured request sequence through the native SocketRocket/Network.framework
+stack, or instrument the iOS call path immediately before `service.SdpOffer`.
+Repeating Thing bootstrap calls, SDP tuning, UI GETs, or generic Tuya RTC
+signalling would re-test paths already disproved by the captures.
 
-- camera: `IPC007_T6S6A3`, firmware `7.1.71`, EU region
-- client: this repo, Python 3.13, aiortc 1.14
-
-### Approaches already tried (no effect — please don't re-tread)
-
-- **p2p NAT registration.** The `getsrv → NatOne → NatGetInfo → PutNatInfo`
-  sequence completes and the server acknowledges the published mapping
-  (`PutNatInfo` returns success). The call still comes back `Ret=8`, so this step
-  is not the missing piece.
-- **Offer contents.** The outgoing offer was diffed against a known-good offer
-  from a working client: the compact-SDP keys and static values match, and only
-  the per-session randoms differ (DTLS fingerprint, ICE ufrag/pwd, SSRCs) — as
-  they must. The offer body does not appear to be the cause.
-- **`phone_code`.** Tried a stable, device-style `phone_code` (via
-  `NOOIE_PHONE_CODE`) instead of a fresh random one per run — no change.
-- **Caller token identity.** Substituting a different, independently-valid
-  api-token did not change the outcome (and hit unrelated auth errors); the
-  identity of the token by itself does not flip `Ret`.
-- **Session creation.** `/webrtcsession/user/videocall` returns HTTP 200 /
-  `code 1000` with valid STUN/TURN credentials every time; the failure is
-  strictly at the `SdpAnswer` stage, not session setup.
+Detailed chronology and sanitized evidence are recorded in
+[PROGRESS.md](PROGRESS.md). No account tokens, passwords, camera identifiers,
+or Thing SDK secrets are stored in these documents.

@@ -1,26 +1,30 @@
 # Progress: `Ret=8` / independent Thing login
 
-Updated: 2026-07-26 16:39 BST
+Updated: 2026-07-26 19:20 BST
 
-## Stop point and current direction
+## Current state
 
 Live video is still blocked: the CLI reaches `response.SdpAnswer`, but the
 camera returns `Ret: 8` without SDP.
 
-The investigation has moved beyond offer/ICE tuning. A fresh official-app login
-proved that Nooie performs a second, separate Thing/Tuya UID login and opens a
-persistent Tuya MQTT connection before attempting video. The CLI does neither.
+The independent Thing/Tuya implementation is now complete and live-validated.
+The CLI reproduces the SDK 5.7.10 UID login, persists a private Thing device
+identity, connects to the regional MQTT/TLS broker with the recovered exact
+credentials, subscribes to the account mailbox, and performs the observed home
+bootstrap. It then completes Nooie login, install registration, discovery, NAT
+registration, WebSocket setup, video-call session creation, and offer/candidate
+delivery without the official app running.
 
-The agreed target is an app-independent implementation: perform the complete
-Thing/Tuya login and MQTT bootstrap inside `nooie-tui`. Reusing an official-app
-token or keeping the app online was diagnostic only and is not the intended
-solution.
+The camera still returns `Ret=8`. Exact identity substitutions, ordinary UI
+bootstrap calls, device attribute reads, offer normalization, ICE credential
+lengths, SocketRocket `Origin`/header shape, and MQTT/HTTPS ordering have all
+been tested without changing that result. The successful official capture has
+no additional HTTP, MQTT, NAT, WebSocket, or relay event left unmatched before
+its accepted answer. The remaining boundary is native client state or
+fingerprinting, or an opaque backend/camera admission rule.
 
-No Thing/Tuya implementation has been added yet. The cryptographic recovery
-barrier is now cleared: both captured login requests and responses decrypt, and
-the captured request signature is reproduced byte-for-byte. Work is currently
-stopped immediately before turning the validated protocol into a dedicated
-Thing client and completing the MQTT bootstrap.
+The sections below are a chronological research log. Later checkpoints
+supersede hypotheses in earlier entries where they conflict.
 
 ## Decisive evidence from the fresh login
 
@@ -262,7 +266,7 @@ python -m compileall -q nooie_tui
 
 These changes are not a `Ret=8` fix by themselves.
 
-## Next steps
+## Next steps at the original handoff
 
 1. Recover and validate the password transform used between
    `uid.token.create` and `uid.password.login` (the decrypted request contains
@@ -280,7 +284,7 @@ These changes are not a `Ret=8` fix by themselves.
    the CLI independently obtains its Thing session, connects to
    `m1.tuyaeu.com:8883`, and receives `SdpAnswer Ret=0`.
 
-## Worktree at handoff
+## Worktree at the original handoff
 
 No commit was created.
 
@@ -948,3 +952,221 @@ have these captures; this is the cheapest, most decisive next action.
   credential derivation, which cross-checks our `derive_mqtt_credentials`.
 - `azerty9971/xtend_tuya` — python webrtc reference manager.
 - `TKems/Victure-Camera-Vulnerabilities` — port-16116 dissector.
+
+## 2026-07-26 — live-login correction and first full integration result
+
+This corrects the earlier implementation checkpoint's unverified password
+theory. Thing SDK 5.7.10 does **not** use PKCS#1 v1.5 for this UID-login path,
+and supplying a double-MD5 password was also rejected by the live service.
+The native path is:
+
+```text
+raw Nooie account password
+  -> lowercase ASCII MD5 hex digest
+  -> raw RSA public operation (`kSecPaddingNone`)
+  -> modulus-sized, zero-left-padded ciphertext
+  -> lowercase hex in `passwd`
+```
+
+That construction matches the successful captured `passwd` byte-for-byte.
+The independent client now performs it directly, and a live UID login succeeds
+with a newly persisted Thing device identity while the official Nooie app is
+not running.
+
+The recovered MQTT credentials also pass a live broker test: TLS connection,
+MQTT 3.1.1 CONNACK, QoS 1 subscription to the account mailbox, a short held
+presence interval, and clean disconnect all succeeded. The broker rejected
+`smart/mb/in/<Nooie camera ID>`; that identifier is not a Thing device ID, so
+the bootstrap now subscribes only to the SDK's account mailbox.
+
+The first complete app-absent CLI run therefore reached all of the following:
+
+1. Nooie login and device discovery;
+2. independent Thing UID login;
+3. authenticated Thing MQTT presence;
+4. Nooie P2P registration, signalling WebSocket connection, and SDP offer.
+
+The camera nevertheless returned `response.SdpAnswer Ret=8`, and no recording
+was created. This disproves the narrow hypothesis that a Thing login plus the
+account-level MQTT subscription alone is sufficient. Current work is tracing
+the official post-login bootstrap and the exact MQTT client identity, then
+will repeat the full run and test suite.
+
+### MQTT identity trace
+
+The MQTT client identity has now been checked directly in the bundled SDK.
+`ThingSmartDeviceCoreEntry`
+`configMQTT:appKey:appSecret:ecode:partnerIdentity:uuid:sid:` receives the
+result of `ThingSmartSDK.uuid` as its `uuid` argument. This is the same
+persistent Thing identifier carried as `deviceId` by signed mobile API
+requests, so the independent identity currently supplied to
+`derive_mqtt_credentials()` is correct. The remaining `Ret=8` investigation
+should not substitute the Nooie `phone_code` or camera ID into the MQTT client
+ID.
+
+## 2026-07-26 — exact post-login bootstrap tested; `Ret=8` remains
+
+The official app's remaining ordinary post-login calls have now been recovered
+and exercised by the independent client. The Nooie `/v2/user/put` request uses
+the same 13-field install metadata shape as the captured iOS request, including
+the stable `phone_code`; it completed successfully before device discovery.
+The Thing client then made the SDK's signed, encrypted
+`m.life.home.space.list` v1.0 request and
+`m.life.my.group.device.list` v2.2 request. The live account currently has one
+home and zero Thing device entries.
+
+The official MQTT trace contains two equal-size encrypted SUBSCRIBE records.
+The independently derived account topic is 32 bytes, which produces that
+observed record size; the sole `m/ug/<homeId>` topic is only 14 bytes and would
+produce a distinctly shorter record. The duplicate official subscriptions are
+therefore the account mailbox registered by two SDK consumers
+(`ThingHomeCacheService` and `ThingSmartCallMQTTHandler`), not an omitted home
+or camera topic. A single broker subscription has the same server-side effect.
+
+The compact-offer prefix was also corrected back to the proven wire form:
+`30 30 0a` (`00` plus bare LF). Only the compact camera answer uses CRLF. This
+is backed by the earlier controlled live test in which CRLF offers were
+silently dropped while bare-LF offers immediately produced
+`response.SdpAnswer`.
+
+A new complete run, with the official Nooie app confirmed absent, successfully
+completed all of these steps:
+
+1. Nooie credential login and `/user/put` install registration;
+2. camera discovery;
+3. independent Thing UID login;
+4. Thing home and device-list bootstrap;
+5. MQTT 3.1.1 TLS connection and account-mailbox subscription;
+6. Nooie NAT registration, signalling connection, session creation, and
+   compact SDP offer delivery.
+
+The camera still returned `Ret=8`, and the output directory remained empty.
+This rules out the normal Nooie install registration and the complete observed
+Thing login/home/MQTT bootstrap as the missing authorization event. The
+remaining investigation is confined to Nooie's long-lived native P2P
+connection/presence, which is separate from both the HTTP session and Thing
+MQTT.
+
+## 2026-07-26 19:20 BST — observable-parity pass and full verification
+
+The “long-lived native P2P presence” hypothesis at the end of the preceding
+checkpoint has now been disproved by accounting for every flow in the
+successful official capture. There is no separate port-6116 connection during
+live-view setup. The official media path is Nooie's clear
+`service.SdpOffer`/`response.SdpAnswer` WebSocket exchange followed by direct
+WebRTC; the Thing MQTT connection performs two duplicate account-mailbox
+subscriptions and no publish.
+
+### Identity and bootstrap controls
+
+The following controlled substitutions and replays all reached the camera but
+left its answer at `Ret=8`:
+
+- the captured stable Nooie HTTP request UUID;
+- the captured Thing device UUID;
+- the exact captured `phone_code` (the configured value was compared without
+  printing it);
+- all three together, with the captured Thing platform/model, `en-GB` locale,
+  OS metadata, and exact Nooie install metadata;
+- ten of twelve ordinary read-only UI API calls from the official session (the
+  remaining two returned normal endpoint errors);
+- the official six-message `atr.get` sequence around candidate delivery.
+
+The Nooie login request and `/user/put` use different captured brand values.
+The implementation now preserves that distinction:
+
+```text
+login/login phone_brand:  iPad Pro 12.9-in. 3rd gen
+user/put phone_brand:     Apple
+```
+
+The current Nooie JWT has the same key/type shape and stable claims as the
+captured official JWT. Expected per-login token and transaction claims differ.
+No identity-field combination changed the camera decision.
+
+### Offer, candidate, and WebSocket parity
+
+After masking only per-session randomness, the generated compact offer has
+zero differing keys, types, or static values from a captured `Ret=0` offer.
+The wire prefix is the required bare-LF `00\n`; the earlier CRLF experiment
+caused silent drops. Across 24 captured official offers, every ICE ufrag has
+length four and every password has length 24. The client now preserves
+aioice's four-character default and changes only its 22-character password
+request to 24.
+
+The two emitted candidates match the official host-then-relay sequence, use
+media section zero, and are both acknowledged. SocketRocket's generated HTTPS
+`Origin` is now present. Its connection builder also confirms that the native
+handshake has no automatic `Accept`, `Accept-Encoding`, or `User-Agent`; those
+aiohttp defaults are now suppressed. A live run with that narrower handshake
+still returned `Ret=8`.
+
+The camera accepted and answered all six `atr.get` reads with complete state,
+but they did not alter the answer. They have therefore been removed from
+production rather than burdening every call with disproved priming messages.
+
+The persisted Thing identity is created with mode 0600. A final safety review
+also removed an unconditional chmod of its parent directory: a user-supplied
+path can no longer restrict permissions on an existing shared parent. A
+regression test covers this case.
+
+The official diagnostic log contains six accepted live-view sequences. It also
+contains one later `Ret=8` answer at 13:55:58, several minutes after the first
+accepted sequence, with no adjacent new offer or immediate retry in the log.
+It therefore does not support treating `Ret=8` as a condition the official app
+fixes with an automatic retry.
+
+### Final verification
+
+The official Nooie process was confirmed absent before the final live test.
+That test completed, in order:
+
+1. Nooie login, exact `/user/put`, and camera discovery;
+2. independent Thing UID login;
+3. MQTT 3.1.1 TLS connection and QoS 1 account subscription;
+4. Thing home/device bootstrap (one home, zero Thing devices);
+5. Nooie NAT registration, native-shaped WebSocket connection, session
+   creation, offer, host candidate, and relay candidate;
+6. acknowledgements for `service.Close`, `service.SdpOffer`, and both
+   `service.IceCandidate` messages.
+
+The next message was `response.SdpAnswer Ret=8`. The two-second target
+recording was not created, and the output directory was empty.
+
+Deterministic verification after removing the attribute experiment:
+
+```text
+uv run python -m unittest discover -v
+  Ran 15 tests — OK (Python 3.11)
+
+uv run --isolated --python 3.13 python -m unittest discover -v
+  Ran 15 tests — OK
+
+uv run python -m compileall -q nooie_tui tests
+uvx ruff check --select E,F nooie_tui/client.py nooie_tui/thing.py tests
+uv lock --check
+git diff --check
+  all passed
+
+uv build --out-dir <temporary directory>
+  source distribution and wheel built successfully
+
+uv run --isolated --with <built wheel> nooie-tui --help
+  installed wheel entry point ran successfully
+```
+
+`nooie-tui --check-config` also passed against the mode-0600 private Thing
+material file. A value-only scan found zero occurrences of the private Thing
+material or sensitive `.env` values in source, tests, configuration examples,
+or documentation.
+
+### Current boundary
+
+There is no known missing HTTP, MQTT, NAT, WebSocket, SDP, candidate, or relay
+event before the answer. The remaining discriminator is below that observable
+sequence: native transport/client state or fingerprinting, or an opaque
+backend/camera admission rule. The next useful experiment must isolate that
+boundary, such as sending the recovered sequence through the native
+SocketRocket/Network.framework stack or instrumenting the app immediately
+before `service.SdpOffer`. Repeating Thing calls, UI reads, SDP tuning, or
+generic Tuya RTC signalling would re-test paths already ruled out.

@@ -12,7 +12,9 @@ license = { text = "MIT" }
 authors = [{ name = "Louis Goddard", email = "louis@datadesk.eco" }]
 dependencies = [
     "aiohttp>=3.12,<4",
+    "aiomqtt>=2.5.1,<3",
     "aiortc>=1.14,<2",
+    "cryptography>=45,<50",
 ]
 
 [project.scripts]

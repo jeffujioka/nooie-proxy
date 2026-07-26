@@ -13,35 +13,35 @@ import secrets
 import shlex
 import time
 import uuid
-from dataclasses import dataclass
+import zlib
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, cast
+from urllib.parse import urlsplit
 
 import aiohttp
+import aioice.ice
 import aiortc.codecs
+import aiortc.rtcpeerconnection
 import aiortc.rtcrtpreceiver
 import aiortc.rtcrtpsender
-import aiortc.rtcpeerconnection
-from av import CodecContext
-from av.frame import Frame
-from av.packet import Packet
-
-from . import apeman
-from av.audio.resampler import AudioResampler
 from aiortc import (
-    AudioStreamTrack,
     RTCBundlePolicy,
     RTCConfiguration,
     RTCIceCandidate,
     RTCIceServer,
     RTCPeerConnection,
-    RTCSessionDescription,
     RTCRtpSender,
+    RTCSessionDescription,
 )
 from aiortc.codecs.base import Decoder, Encoder
 from aiortc.contrib.media import MediaRecorder
 from aiortc.jitterbuffer import JitterFrame
+from aiortc.rtcdtlstransport import (
+    SSL,
+    RTCCertificate,
+)
 from aiortc.rtcrtpparameters import (
     RTCRtcpFeedback,
     RTCRtpCodecParameters,
@@ -49,14 +49,22 @@ from aiortc.rtcrtpparameters import (
 )
 from aiortc.rtp import RtcpRrPacket
 from aiortc.sdp import SessionDescription, candidate_from_sdp
-from aiortc.rtcdtlstransport import (
-    RTCCertificate,
-    SSL,
-    generate_certificate,
-)
-from cryptography.hazmat.primitives.asymmetric import rsa
+from av import CodecContext
+from av.audio.resampler import AudioResampler
+from av.frame import Frame
+from av.packet import Packet
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+from . import apeman
+from .thing import (
+    ThingClient,
+    load_or_create_device_id,
+    mqtt_presence,
+    normalize_device_id,
+    thing_app_from_environment,
+)
 
 
 @dataclass(frozen=True)
@@ -71,6 +79,37 @@ class Config:
     model_id: str
     api_base: str = "https://app.eu.nooie.com/v2"
     ws_url: str = "wss://wss.eu.nooie.com/ws"
+
+
+@dataclass
+class SignallingCall:
+    """Per-call identifiers used by Nooie's iOS signalling implementation."""
+
+    call_uuid: str = field(
+        default_factory=lambda: str(uuid.uuid4()).upper()
+    )
+    message_id: int = 1000
+
+    @property
+    def call_id(self) -> str:
+        return f"iOS_{self.call_uuid[:12]}"
+
+    def next_message_id(self, *, call_scoped: bool = False) -> str:
+        self.message_id += 1
+        prefix = (
+            self.call_id
+            if call_scoped
+            else f"iOS_{str(uuid.uuid4()).upper()}"
+        )
+        return f"{prefix}_{self.message_id}"
+
+
+@dataclass(frozen=True)
+class LocalIceCandidate:
+    sdp: str
+    sdp_mid: str
+    sdp_mline_index: int
+    ice_ufrag: str
 
 
 def load_dotenv(path: Path = Path(".env")) -> None:
@@ -146,6 +185,9 @@ def request_headers(config: Config) -> dict[str, str]:
     return {
         "Accept": "application/json",
         "Content-Type": "application/json",
+        "User-Agent": os.environ.get(
+            "NOOIE_USER_AGENT", "Nooie_IOS_3.7.0"
+        ),
         "appid": config.app_id,
         "uid": config.uid,
         "uuid": config.request_uuid,
@@ -174,6 +216,86 @@ def local_phone_code() -> str:
     return os.environ.get("NOOIE_PHONE_CODE", str(uuid.uuid4()).upper())
 
 
+def websocket_origin(url: str) -> str:
+    """Match SocketRocket's native ws→http / wss→https Origin mapping."""
+    parsed = urlsplit(url)
+    schemes = {"ws": "http", "wss": "https"}
+    if parsed.scheme not in schemes or not parsed.netloc:
+        raise ValueError("Nooie WebSocket URL is invalid")
+    return f"{schemes[parsed.scheme]}://{parsed.netloc}"
+
+
+def login_request_body(
+    username: str,
+    password: str,
+    phone_code: str,
+    country_code: str,
+    zone: int,
+) -> dict[str, Any]:
+    """Build the credential-login body used by the current Nooie iOS app."""
+    return {
+        "account": username,
+        "country": country_code,
+        "password": hashlib.md5(password.encode()).hexdigest(),
+        "phone_brand": os.environ.get(
+            "NOOIE_LOGIN_PHONE_BRAND",
+            "iPad Pro 12.9-in. 3rd gen",
+        ),
+        "phone_code": phone_code,
+        "zone": zone,
+    }
+
+
+def client_registration(config: Config) -> dict[str, Any]:
+    """Build the install metadata posted by Nooie after a successful login."""
+    utc_offset = datetime.now().astimezone().utcoffset()
+    zone = int(utc_offset.total_seconds() // 3600) if utc_offset else 0
+    return {
+        "phone_brand": os.environ.get("NOOIE_PHONE_BRAND", "Apple"),
+        "zone": zone,
+        "phone_version": os.environ.get("NOOIE_PHONE_VERSION", "26.5"),
+        "app_version": os.environ.get("NOOIE_APP_VERSION", "3.7.0"),
+        "phone_screen": os.environ.get(
+            "NOOIE_PHONE_SCREEN", "[1470, 956]"
+        ),
+        "device_type": int(os.environ.get("NOOIE_DEVICE_TYPE", "2")),
+        "phone_code": config.phone_code,
+        "package_name": os.environ.get(
+            "NOOIE_PACKAGE_NAME", "com.nooie.home"
+        ),
+        "language": os.environ.get("NOOIE_LANGUAGE", "en"),
+        "app_version_code": os.environ.get(
+            "NOOIE_APP_VERSION_CODE", "11"
+        ),
+        "country": os.environ.get("NOOIE_COUNTRY_CODE", "44"),
+        "push_type": int(os.environ.get("NOOIE_PUSH_TYPE", "3")),
+        "phone_model": os.environ.get("NOOIE_PHONE_MODEL", "iPad8,6"),
+    }
+
+
+async def register_user_client(
+    http: aiohttp.ClientSession, config: Config
+) -> None:
+    """Run the normal post-login install registration used by Nooie."""
+    async with http.post(
+        f"{config.api_base}/user/put",
+        headers=request_headers(config),
+        json=client_registration(config),
+    ) as response:
+        payload = await response.json(content_type=None)
+    if (
+        response.status != 200
+        or not isinstance(payload, dict)
+        or payload.get("code") != 1000
+    ):
+        code = payload.get("code") if isinstance(payload, dict) else None
+        message = payload.get("msg") if isinstance(payload, dict) else None
+        raise RuntimeError(
+            f"client registration failed: HTTP {response.status}, "
+            f"code={code}, msg={message!r}"
+        )
+
+
 async def login_config() -> Config:
     app_id, app_secret = app_credentials()
     request_uuid = os.environ.get("NOOIE_REQUEST_UUID", uuid.uuid4().hex)
@@ -187,14 +309,13 @@ async def login_config() -> Config:
     username, password = login_environment()
     utc_offset = datetime.now().astimezone().utcoffset()
     zone = int(utc_offset.total_seconds() // 3600) if utc_offset else 0
-    body = {
-        "account": username,
-        "country": os.environ.get("NOOIE_COUNTRY_CODE", "44"),
-        "password": hashlib.md5(password.encode()).hexdigest(),
-        "phone_brand": os.environ.get("NOOIE_PHONE_BRAND", "nooie-tui"),
-        "phone_code": phone_code,
-        "zone": zone,
-    }
+    body = login_request_body(
+        username,
+        password,
+        phone_code,
+        os.environ.get("NOOIE_COUNTRY_CODE", "44"),
+        zone,
+    )
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as http:
         async with http.post(
@@ -223,6 +344,7 @@ async def login_config() -> Config:
             api_base=api_base,
             ws_url=ws_url,
         )
+        await register_user_client(http, config)
         device = await select_camera(http, config)
     return Config(
         **{
@@ -282,8 +404,8 @@ async def select_camera(
     c = apeman.coords_from_device(selected)
     print(
         f"p2p coords: relay {c.hb_domain} ({c.hb_server}:{c.hb_port}) "
-        f"lan {c.local_ip} wan {c.wan_ip} puuid {c.puuid} "
-        f"secret<{len(c.secret)}>",
+        f"lan {c.local_ip} wan {c.wan_ip}; "
+        f"credentials loaded={bool(c.puuid and c.secret)}",
         flush=True,
     )
     return selected
@@ -308,12 +430,18 @@ async def create_session(
 
 
 def ice_servers(session: dict[str, Any]) -> list[RTCIceServer]:
-    urls = []
+    servers = []
     for item in session.get("user_ices", []):
         url = item.get("iceurl")
         if url:
-            urls.append(url)
-    return [RTCIceServer(urls=url) for url in urls]
+            servers.append(
+                RTCIceServer(
+                    urls=url,
+                    username=item.get("username") or None,
+                    credential=item.get("password") or None,
+                )
+            )
+    return servers
 
 
 def device_ice_fields(
@@ -498,6 +626,23 @@ def enable_rsa_dtls() -> None:
         SSL.Connection.set_accept_state = set_accept_state
 
 
+def enable_nooie_ice_credentials() -> None:
+    """Match the credential sizes generated by Nooie's WebRTC build."""
+    if getattr(aioice.ice.random_string, "_nooie_lengths", False):
+        return
+    original_random_string = aioice.ice.random_string
+
+    def random_string(length: int) -> str:
+        # aioice's default four-character ufrag matches all 24 captured
+        # official offers. Nooie's build differs only in its 24-character
+        # password (aioice normally requests 22).
+        nooie_length = {22: 24}.get(length, length)
+        return original_random_string(nooie_length)
+
+    setattr(random_string, "_nooie_lengths", True)
+    aioice.ice.random_string = random_string
+
+
 def force_h264(peer: RTCPeerConnection) -> None:
     enable_aac()
     transport_cc = RTCRtpHeaderExtensionParameters(
@@ -555,28 +700,45 @@ def sdp_value(sdp: str, prefix: str, default: str = "") -> str:
     return default
 
 
-def local_candidates(sdp: str) -> list[str]:
-    """host/srflx candidates worth trickling, loopback and mDNS excluded."""
-    chosen = []
+def local_candidates(sdp: str) -> list[LocalIceCandidate]:
+    """usable IPv4 candidates worth trickling, loopback and mDNS excluded."""
+    chosen: list[LocalIceCandidate] = []
+    ice_ufrag = sdp_value(sdp, "a=ice-ufrag:")
+    sdp_mid = ""
+    sdp_mline_index = -1
     for line in sdp.splitlines():
+        if line.startswith("m="):
+            sdp_mline_index += 1
+            sdp_mid = str(sdp_mline_index)
+            continue
+        if line.startswith("a=mid:"):
+            sdp_mid = line[len("a=mid:") :]
+            continue
         if not line.startswith("a=candidate:"):
             continue
         fields = line[len("a=candidate:") :].split()
         if len(fields) < 8:
             continue
         address, kind = fields[4], fields[7]
-        if kind not in ("host", "srflx") or address.endswith(".local"):
+        if kind not in ("host", "relay") or address.endswith(".local"):
             continue
         if address.startswith("127.") or ":" in address:
             continue
-        chosen.append(line[len("a=") :])
-    return chosen
-
-
-def compact_candidate(candidate: str) -> str:
-    if candidate.startswith("candidate:"):
-        candidate = candidate[len("candidate:") :]
-    return candidate.replace(" ", "")
+        chosen.append(
+            LocalIceCandidate(
+                sdp=line[len("a=") :],
+                sdp_mid=sdp_mid,
+                sdp_mline_index=sdp_mline_index,
+                ice_ufrag=ice_ufrag,
+            )
+        )
+    # Nooie's offer is BUNDLE-only and its iOS client trickles the shared
+    # transport once, against the first (video) media section.
+    return [
+        candidate
+        for candidate in chosen
+        if candidate.sdp_mline_index == 0
+    ]
 
 
 def compact_sdp_offer(sdp: str) -> str:
@@ -645,8 +807,57 @@ def compact_sdp_offer(sdp: str) -> str:
             "fb": 126,
         },
     }
-    # the offer prefixes the compact JSON with two zeros and a bare LF ("00\n").
+    # The official offer uses a bare LF (30 30 0a). Only compact answers use
+    # CRLF; the camera silently drops offers carrying that answer marker.
     return "00\n" + json.dumps(payload, separators=(",", ":"))
+
+
+def compact_outbound_candidate(candidate: LocalIceCandidate) -> str:
+    """encode the numeric, space-free ICE dialect emitted by Nooie's SDK."""
+    fields = candidate.sdp.split()
+    if (
+        len(fields) < 8
+        or not fields[0].startswith("candidate:")
+        or fields[6].lower() != "typ"
+    ):
+        raise ValueError(f"unsupported local ICE candidate: {candidate.sdp!r}")
+    kind = fields[7].lower()
+    priorities = {
+        "host": "2122260223",
+        "srflx": "1686052607",
+        "relay": "41885439",
+    }
+    if kind not in priorities:
+        raise ValueError(f"unsupported local ICE candidate type: {kind!r}")
+    source_foundation = fields[0][len("candidate:") :]
+    numeric_foundation = zlib.crc32(
+        f"{source_foundation}:{kind}".encode()
+    )
+    output = [
+        f"candidate:{numeric_foundation}",
+        fields[1],
+        fields[2].lower(),
+        priorities[kind],
+        fields[4],
+        fields[5],
+        "typ",
+        kind,
+    ]
+    if kind in ("srflx", "relay"):
+        output.extend(["raddr", "0.0.0.0", "rport", "0"])
+    output.extend(
+        [
+            "generation",
+            "0",
+            "ufrag",
+            candidate.ice_ufrag,
+            "network-id",
+            "1",
+            "network-cost",
+            "10",
+        ]
+    )
+    return "".join(output)
 
 
 def expand_compact_candidate(value: str) -> str:
@@ -834,15 +1045,15 @@ def compact_sdp_answer(value: str) -> str:
 
 
 def signalling_offer(
-    config: Config, session: dict[str, Any], sdp: str
-) -> tuple[str, str, dict[str, Any]]:
-    call_uuid = str(uuid.uuid4()).upper()
-    call_id = f"iOS_{call_uuid[:12]}"
-    message_id = 1000
+    config: Config,
+    session: dict[str, Any],
+    call: SignallingCall,
+    sdp: str,
+) -> dict[str, Any]:
     urls, usernames, passwords = device_ice_fields(session)
     envelope = {
         "method": "service.SdpOffer",
-        "msg_id": f"{call_id}_{message_id + 1}",
+        "msg_id": call.next_message_id(call_scoped=True),
         "ver": "1.0",
         "time": int(time.time()),
         "origin": 1,
@@ -850,7 +1061,7 @@ def signalling_offer(
         "device_model": config.model_id,
         "data": {
             "SessionId": session["session_id"],
-            "call_id": call_id,
+            "call_id": call.call_id,
             "IceUrl": urls,
             "IceUsername": usernames,
             "IcePassword": passwords,
@@ -867,26 +1078,42 @@ def signalling_offer(
             "onlyRelay": 0,
         },
     }
-    return call_id, call_uuid, envelope
+    return envelope
+
+
+def signalling_reset(
+    config: Config,
+    call: SignallingCall,
+) -> dict[str, Any]:
+    """Clear any stale device call before establishing a new session."""
+    return {
+        "method": "service.Close",
+        "msg_id": call.next_message_id(),
+        "ver": "1.0",
+        "time": int(time.time()),
+        "origin": 1,
+        "uuid": config.device_id,
+        "device_model": config.model_id,
+        "data": {},
+    }
 
 
 def signalling_switch(
     config: Config,
     session: dict[str, Any],
-    call_id: str,
-    call_uuid: str,
+    call: SignallingCall,
 ) -> dict[str, Any]:
     return {
         "method": "service.Switch",
-        "msg_id": f"{call_id}_1002",
+        "msg_id": call.next_message_id(),
         "ver": "1.0",
-        "tme": int(time.time()),
+        "time": int(time.time()),
         "origin": 1,
         "uuid": config.device_id,
         "device_model": config.model_id,
         "data": {
             "SessionId": session["session_id"],
-            "call_id": call_id,
+            "call_id": call.call_id,
             "Action": 0,
         },
     }
@@ -895,12 +1122,12 @@ def signalling_switch(
 def signalling_candidate(
     config: Config,
     session: dict[str, Any],
-    call_id: str,
-    candidate: str,
+    call: SignallingCall,
+    candidate: LocalIceCandidate,
 ) -> dict[str, Any]:
     return {
         "method": "service.IceCandidate",
-        "msg_id": f"{str(uuid.uuid4()).upper()}_1002",
+        "msg_id": call.next_message_id(),
         "ver": "1.0",
         "time": int(time.time()),
         "origin": 1,
@@ -908,10 +1135,10 @@ def signalling_candidate(
         "device_model": config.model_id,
         "data": {
             "SessionId": session["session_id"],
-            "call_id": call_id,
-            "WebrtcCandidate": "candidate:" + compact_candidate(candidate),
-            "WebrtcSdpMLineIndex": 0,
-            "WebrtcSdpMid": "0",
+            "call_id": call.call_id,
+            "WebrtcCandidate": compact_outbound_candidate(candidate),
+            "WebrtcSdpMLineIndex": candidate.sdp_mline_index,
+            "WebrtcSdpMid": candidate.sdp_mid,
             "nsType": "",
             "type": "candidate",
         },
@@ -921,12 +1148,11 @@ def signalling_candidate(
 def signalling_close(
     config: Config,
     session: dict[str, Any],
-    call_id: str,
-    call_uuid: str,
+    call: SignallingCall,
 ) -> dict[str, Any]:
     return {
         "method": "service.Close",
-        "msg_id": f"{call_id}_1003",
+        "msg_id": call.next_message_id(),
         "ver": "1.0",
         "time": int(time.time()),
         "origin": 1,
@@ -934,7 +1160,7 @@ def signalling_close(
         "device_model": config.model_id,
         "data": {
             "SessionId": session["session_id"],
-            "call_id": call_id,
+            "call_id": call.call_id,
         },
     }
 
@@ -1077,17 +1303,25 @@ async def receive(
     config: Config, output: Path, duration: float
 ) -> None:
     enable_rsa_dtls()
+    enable_nooie_ice_credentials()
     # publish our nat mapping on the p2p network so the camera can reach us.
     # `reg` keeps its udp socket open for the duration of the call.
     print("registering on the p2p network", flush=True)
     reg = await asyncio.to_thread(apeman.register, config.uid)
     print(
-        f"registered {reg.uid}: wan {reg.wan_ip}:{reg.wan_port} "
+        f"registered p2p mapping: wan {reg.wan_ip}:{reg.wan_port} "
         f"lan {reg.lan_ip}:{reg.lan_port}",
         flush=True,
     )
     timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(timeout=timeout) as http:
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        skip_auto_headers={
+            "Accept",
+            "Accept-Encoding",
+            "User-Agent",
+        },
+    ) as http:
         ws_headers = {
             "uid": config.uid,
             "appid": config.app_id,
@@ -1095,11 +1329,19 @@ async def receive(
                 "NOOIE_WS_API_TOKEN", config.api_token
             ),
             "phone_code": config.phone_code,
+            "Origin": websocket_origin(config.ws_url),
         }
         print("connecting to Nooie signalling WebSocket", flush=True)
         async with http.ws_connect(
             config.ws_url, headers=ws_headers, heartbeat=20
         ) as websocket:
+            call = SignallingCall()
+            await websocket.send_json(
+                signalling_reset(config, call),
+                dumps=lambda value: json.dumps(
+                    value, separators=(",", ":")
+                ),
+            )
             print("creating Nooie WebRTC session", flush=True)
             session = await create_session(http, config)
             peer = RTCPeerConnection(
@@ -1130,7 +1372,6 @@ async def receive(
                 if peer.connectionState == "connected":
                     connected.set()
 
-            call_id = call_uuid = ""
             try:
                 force_h264(peer)
                 offer = await peer.createOffer()
@@ -1139,9 +1380,10 @@ async def receive(
                     raise RuntimeError(
                         "aiortc did not produce a local description"
                     )
-                call_id, call_uuid, frame = signalling_offer(
+                frame = signalling_offer(
                     config,
                     session,
+                    call,
                     compact_sdp_offer(peer.localDescription.sdp),
                 )
                 await websocket.send_json(frame, dumps=lambda value: json.dumps(
@@ -1154,7 +1396,7 @@ async def receive(
                         signalling_candidate(
                             config,
                             session,
-                            call_id,
+                            call,
                             local_candidate,
                         ),
                         dumps=lambda value: json.dumps(
@@ -1183,7 +1425,7 @@ async def receive(
                             flush=True,
                         )
                         signal = matching_signal(
-                            value, call_id, session["session_id"]
+                            value, call.call_id, session["session_id"]
                         )
                         if signal is None:
                             continue
@@ -1192,8 +1434,7 @@ async def receive(
                             ret = int(data.get("Ret", 0))
                             if ret != 0:
                                 raise RuntimeError(
-                                    f"camera rejected the call with Ret={ret} "
-                                    f"(data={json.dumps(data)})"
+                                    f"camera rejected the call with Ret={ret}"
                                 )
                             answer_sdp = data.get("WebrtcSdp")
                             if answer_sdp:
@@ -1247,9 +1488,7 @@ async def receive(
                         "camera did not return an SDP answer within 30 seconds"
                     )
                 await websocket.send_json(
-                    signalling_switch(
-                        config, session, call_id, call_uuid
-                    ),
+                    signalling_switch(config, session, call),
                     dumps=lambda value: json.dumps(
                         value, separators=(",", ":")
                     ),
@@ -1314,12 +1553,10 @@ async def receive(
             finally:
                 # always release the session so the camera's small P2P
                 # connection pool does not fill with half-open calls.
-                if call_id and not websocket.closed:
+                if not websocket.closed:
                     try:
                         await websocket.send_json(
-                            signalling_close(
-                                config, session, call_id, call_uuid
-                            ),
+                            signalling_close(config, session, call),
                             dumps=lambda value: json.dumps(
                                 value, separators=(",", ":")
                             ),
@@ -1330,6 +1567,61 @@ async def receive(
                     await recorder_start
                 await recorder.stop()
                 await peer.close()
+
+
+async def run(output: Path, duration: float) -> None:
+    config = await login_config()
+    thing_app = thing_app_from_environment()
+    thing_device_id = load_or_create_device_id()
+    _, password = login_environment()
+    country_code = os.environ.get("NOOIE_COUNTRY_CODE", "44")
+
+    print("logging into Thing with an independent device identity", flush=True)
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as http:
+        thing_client = ThingClient(thing_app, thing_device_id)
+        thing_session = await thing_client.login_by_uid(
+            http,
+            config.uid,
+            password,
+            country_code,
+        )
+        print("Thing UID login succeeded", flush=True)
+
+        # The SDK opens MQTT immediately after login, then performs its final
+        # home bootstrap on the still-live HTTPS session.
+        async with mqtt_presence(
+            thing_app,
+            thing_session,
+            thing_device_id,
+        ):
+            home_spaces = await thing_client.home_spaces(
+                http, thing_session
+            )
+            home_device_lists = []
+            for home in home_spaces:
+                raw_home_id = home.get("gid", home.get("groupId"))
+                try:
+                    home_id = int(raw_home_id)
+                except (TypeError, ValueError):
+                    continue
+                home_device_lists.append(
+                    await thing_client.home_devices(
+                        http, thing_session, home_id
+                    )
+                )
+            device_count = sum(
+                len(items)
+                for items in home_device_lists
+                if isinstance(items, list)
+            )
+            print(
+                f"Thing home bootstrap loaded {len(home_spaces)} "
+                f"home{'s' if len(home_spaces) != 1 else ''} and "
+                f"{device_count} device entries",
+                flush=True,
+            )
+            await receive(config, output, duration)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1356,12 +1648,15 @@ def main() -> None:
     if args.check_config:
         login_environment()
         app_credentials()
+        thing_app_from_environment()
+        configured_thing_id = os.environ.get("NOOIE_THING_DEVICE_ID", "")
+        if configured_thing_id:
+            normalize_device_id(configured_thing_id)
         print("configuration is complete")
         return
-    config = asyncio.run(login_config())
     if args.output.exists():
         raise SystemExit(f"refusing to overwrite {args.output}")
-    asyncio.run(receive(config, args.output, args.duration))
+    asyncio.run(run(args.output, args.duration))
 
 
 if __name__ == "__main__":
