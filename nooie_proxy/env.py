@@ -2,7 +2,6 @@
 
 import os
 import re
-import shlex
 import sys
 import uuid
 from contextlib import suppress
@@ -28,7 +27,13 @@ def state_dir() -> Path:
 
 
 def load_dotenv(path: Path) -> None:
-    """read a shell-style dotenv without exposing its values on argv."""
+    """read a dotenv without exposing its values on argv.
+
+    values are taken literally: a password is far more likely to contain #,
+    $ or a quote than the file is to want shell semantics, and silently
+    mangling one costs an unexplained login failure. wrap a value in matching
+    quotes to keep surrounding space, or start a trailing comment with " #".
+    """
     if not path.is_file():
         return
     for number, raw in enumerate(path.read_text().splitlines(), start=1):
@@ -39,11 +44,12 @@ def load_dotenv(path: Path) -> None:
         key = key.strip()
         if not separator or not re.fullmatch(r"[A-Za-z_]\w*", key):
             raise SystemExit(f"{path}:{number}: expected KEY=VALUE")
-        try:
-            parts = shlex.split(value, comments=True, posix=True)
-        except ValueError as error:
-            raise SystemExit(f"{path}:{number}: {error}") from error
-        os.environ.setdefault(key, " ".join(parts))
+        value = value.strip()
+        if len(value) > 1 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        else:
+            value = value.partition(" #")[0].rstrip()
+        os.environ.setdefault(key, value)
 
 
 def load_environment() -> None:
