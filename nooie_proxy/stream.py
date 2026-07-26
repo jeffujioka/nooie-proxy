@@ -1,4 +1,4 @@
-"""place one webrtc call and mux the camera's a/v into fragmented mp4."""
+"""place one webrtc call and mux the camera's a/v to the sink."""
 
 import asyncio
 import json
@@ -9,6 +9,7 @@ from typing import Any
 
 import aiohttp
 from aiortc import (
+    MediaStreamTrack,
     RTCBundlePolicy,
     RTCConfiguration,
     RTCPeerConnection,
@@ -30,12 +31,60 @@ FRAGMENTED = {"movflags": "frag_keyframe+empty_moov+default_base_moof"}
 # repeats its tables forever, so anyone can tune in at the next keyframe.
 JOINABLE = ("udp", "tcp", "srt", "http", "https")
 ANSWER_TIMEOUT = 30
+# the recorder encodes video at 30fps, so two frames dated inside the same
+# 1/30s tick reach the muxer with one dts between them and end the stream.
+TICK = {"video": 90000 // 30, "audio": 1}
 
 
 def container(target: str) -> tuple[str, dict[str, str]]:
     """the muxer that suits how this sink will be read."""
     scheme = target.partition("://")[0] if "://" in target else ""
     return ("mpegts", {}) if scheme in JOINABLE else ("mp4", FRAGMENTED)
+
+
+def aligned(target: str) -> str:
+    """size udp datagrams in whole transport packets.
+
+    ffmpeg fills a datagram to 1472 bytes, which is seven 188-byte packets
+    and a fragment of an eighth. a player that is handed the fragment
+    discards it and the head of the next datagram with it, which vlc
+    reports as a continuity error a hundred times a second.
+    """
+    if not target.startswith("udp://") or "pkt_size=" in target:
+        return target
+    return f"{target}{'&' if '?' in target else '?'}pkt_size={7 * 188}"
+
+
+class Timed(MediaStreamTrack):
+    """a track dated by this machine's clock rather than the camera's.
+
+    aiortc hands on the camera's rtp timing untouched: each track begins at
+    its own first packet, and this camera's video clock runs some 3.5% fast,
+    so video gains about two minutes on audio every hour. fragmented mp4
+    conceals both faults, since the muxer rebases each track, but mpeg-ts
+    carries timestamps as it is given them -- a player joining an hour-old
+    stream is handed tracks minutes apart and shows nothing.
+    """
+
+    def __init__(self, track: MediaStreamTrack, origin: float) -> None:
+        super().__init__()
+        self.kind = track.kind
+        self.track = track
+        self.origin = origin
+        self.shift: int | None = None
+        self.last = -TICK[self.kind]
+
+    async def recv(self) -> Any:
+        frame = await self.track.recv()
+        now = round((time.monotonic() - self.origin) / frame.time_base)
+        if self.shift is None:
+            self.shift = now - frame.pts
+        # video is dated by arrival, the one clock here that keeps time.
+        # audio arrives true, and its sample cadence has to stay continuous
+        # for the aac encoder, so it is moved bodily onto the same origin.
+        stamp = now if self.kind == "video" else frame.pts + self.shift
+        frame.pts = self.last = max(self.last + TICK[self.kind], stamp)
+        return frame
 
 
 async def stream(config: Config, target: str) -> None:
@@ -75,7 +124,8 @@ async def place_call(
         )
     )
     muxer, options = container(target)
-    sink = MediaRecorder(target, format=muxer, options=options)
+    sink = MediaRecorder(aligned(target), format=muxer, options=options)
+    origin = time.monotonic()
     started: asyncio.Task[None] | None = None
     connected = asyncio.Event()
     stopped = asyncio.Event()
@@ -92,7 +142,7 @@ async def place_call(
     def on_track(track: Any) -> None:
         nonlocal started
         log(f"receiving {track.kind}")
-        sink.addTrack(track)
+        sink.addTrack(Timed(track, origin))
         started = started or asyncio.create_task(open_sink())
 
     @peer.on("connectionstatechange")

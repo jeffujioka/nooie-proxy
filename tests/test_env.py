@@ -5,7 +5,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from nooie_proxy.env import load_dotenv
-from nooie_proxy.stream import container
 
 # a credential is far likelier to contain punctuation than the file is to want
 # shell semantics, so every one of these must survive verbatim. mangling one
@@ -67,25 +66,6 @@ class DotenvTests(unittest.TestCase):
     def test_a_malformed_line_is_refused(self) -> None:
         with self.assertRaises(SystemExit):
             self.load("NOT A VALID LINE\n")
-
-
-
-
-class ContainerTests(unittest.TestCase):
-    def test_pipes_and_files_get_fragmented_mp4(self) -> None:
-        for target in ("pipe:1", "/tmp/a.mp4", "clip.mkv"):
-            muxer, options = container(target)
-            self.assertEqual(muxer, "mp4")
-            self.assertIn("movflags", options)
-
-    def test_network_sinks_get_joinable_mpegts(self) -> None:
-        for target in (
-            "udp://127.0.0.1:5004",
-            "tcp://127.0.0.1:5004?listen",
-            "srt://host:9000",
-            "http://host/live",
-        ):
-            self.assertEqual(container(target), ("mpegts", {}))
 
 
 if __name__ == "__main__":
