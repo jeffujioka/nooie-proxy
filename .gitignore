@@ -1,10 +1,14 @@
 .env*
 !.env.example
+.claude/
 .venv/
 __pycache__/
 *.pyc
+*.swp
 /nooie.mp4
 *.mp4
+*.pcap
+*.pcapng
 dist/
 build/
 *.egg-info/

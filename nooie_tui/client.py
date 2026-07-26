@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import base64
 import fractions
+from getpass import getpass
 import hashlib
 import hmac
 import json
@@ -49,7 +50,7 @@ from aiortc.rtcrtpparameters import (
 )
 from aiortc.rtp import RtcpRrPacket
 from aiortc.sdp import SessionDescription, candidate_from_sdp
-from av import CodecContext
+from av import CodecContext, InvalidDataError
 from av.audio.resampler import AudioResampler
 from av.frame import Frame
 from av.packet import Packet
@@ -65,6 +66,9 @@ from .thing import (
     normalize_device_id,
     thing_app_from_environment,
 )
+
+DEFAULT_APP_ID = "4adcd2139621b1ef"
+DEFAULT_APP_SECRET = "9e03f0b14adcd2139621b1ef984b2ac0"
 
 
 @dataclass(frozen=True)
@@ -136,16 +140,11 @@ def load_dotenv(path: Path = Path(".env")) -> None:
 
 
 def app_credentials() -> tuple[str, str]:
-    app_id = os.environ.get("NOOIE_APP_ID", "")
-    app_secret = os.environ.get("NOOIE_APP_SECRET", "")
-    missing = []
-    if not app_id:
-        missing.append("NOOIE_APP_ID")
-    if not app_secret:
-        missing.append("NOOIE_APP_SECRET")
-    if missing:
-        raise SystemExit("missing environment variables: " + ", ".join(missing))
-    return app_id, app_secret
+    """Return Nooie's shared app credentials, allowing rotation overrides."""
+    return (
+        os.environ.get("NOOIE_APP_ID") or DEFAULT_APP_ID,
+        os.environ.get("NOOIE_APP_SECRET") or DEFAULT_APP_SECRET,
+    )
 
 
 def login_headers(
@@ -223,6 +222,39 @@ def websocket_origin(url: str) -> str:
     if parsed.scheme not in schemes or not parsed.netloc:
         raise ValueError("Nooie WebSocket URL is invalid")
     return f"{schemes[parsed.scheme]}://{parsed.netloc}"
+
+
+def websocket_json_dumps(value: Any) -> str:
+    """Match NSJSONSerialization's pretty-printed signalling wire format."""
+
+    def render(item: Any, level: int) -> str:
+        indentation = "  " * level
+        child_indentation = "  " * (level + 1)
+        if isinstance(item, dict):
+            if not item:
+                return "{\n\n" + indentation + "}"
+            fields = []
+            for key in sorted(item):
+                encoded_key = json.dumps(str(key), ensure_ascii=False)
+                fields.append(
+                    child_indentation
+                    + encoded_key
+                    + " : "
+                    + render(item[key], level + 1)
+                )
+            return "{\n" + ",\n".join(fields) + "\n" + indentation + "}"
+        if isinstance(item, (list, tuple)):
+            if not item:
+                return "[\n\n" + indentation + "]"
+            fields = [
+                child_indentation + render(child, level + 1)
+                for child in item
+            ]
+            return "[\n" + ",\n".join(fields) + "\n" + indentation + "]"
+        encoded = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+        return encoded.replace("/", r"\/")
+
+    return render(value, 0)
 
 
 def login_request_body(
@@ -401,13 +433,6 @@ async def select_camera(
         f"({'online' if selected in online else 'offline'})",
         flush=True,
     )
-    c = apeman.coords_from_device(selected)
-    print(
-        f"p2p coords: relay {c.hb_domain} ({c.hb_server}:{c.hb_port}) "
-        f"lan {c.local_ip} wan {c.wan_ip}; "
-        f"credentials loaded={bool(c.puuid and c.secret)}",
-        flush=True,
-    )
     return selected
 
 
@@ -472,7 +497,13 @@ class AacDecoder(Decoder):
         packet = Packet(data)
         packet.pts = encoded_frame.timestamp
         packet.time_base = self.time_base
-        return cast(list[Frame], self.codec.decode(packet))
+        try:
+            return cast(list[Frame], self.codec.decode(packet))
+        except InvalidDataError:
+            # Some cameras intermittently emit an incomplete AAC access unit.
+            # Dropping that unit keeps aiortc's decoder worker alive for the
+            # following valid RTP packets.
+            return []
 
 
 class AacEncoder(Encoder):
@@ -746,31 +777,35 @@ def compact_sdp_offer(sdp: str) -> str:
     ice_ufrag = sdp_value(sdp, "a=ice-ufrag:")
     ice_pwd = sdp_value(sdp, "a=ice-pwd:")
     fingerprint = sdp_value(sdp, "a=fingerprint:")
-    # o= encoding: real session id, session version 2.
-    origin = sdp_value(sdp, "o=").split()
-    session_id = origin[1] if len(origin) > 1 else str(secrets.randbits(62))
+    # Every preserved iOS offer uses a 19-digit WebRTC origin session ID.
+    # aiortc uses a shorter timestamp-like value, so generate the native shape
+    # independently; the compact offer is the only SDP representation sent.
+    session_id = str(
+        1_000_000_000_000_000_000
+        + secrets.randbelow(9_000_000_000_000_000_000)
+    )
     cname = base64.b64encode(secrets.token_bytes(12)).decode()
     video_ssrc = str(secrets.randbits(32))
     video_rtx_ssrc = str(secrets.randbits(32))
     audio_ssrc = str(secrets.randbits(32))
 
     common: dict[str, Any] = {
-        "o": "tricklerenomination",
-        "I": "IP40.0.0.0",
+        "o": "trickle renomination",
+        "I": " IP4 0.0.0.0",
         "tcc": 4,
         "p": ice_pwd,
         "is": 1,
-        "isc": "WMSLo",
+        "isc": " WMS Lo",
         "ll": 14,
-        "r": "9INIP40.0.0.0",
-        "iO": f"{session_id}2INIP4127.0.0.1",
-        "iT": "00",
+        "r": "9 IN IP4 0.0.0.0",
+        "iO": f" {session_id} 2 IN IP4 127.0.0.1",
+        "iT": "0 0",
         "s": "actpass",
-        "iG": "01",
+        "iG": "0 1",
         "pp": 12,
         "u": ice_ufrag,
         "abs": 7,
-        "ft": fingerprint.replace(" ", ""),
+        "ft": fingerprint,
         "v": 1,
     }
     payload = {
@@ -783,7 +818,7 @@ def compact_sdp_offer(sdp: str) -> str:
             "pt": 96,
             "ce": cname,
             "dc": 1,
-            "md": "LoAID",
+            "md": "Lo AID",
             "pts": 16000,
             "m": 9,
         },
@@ -792,11 +827,11 @@ def compact_sdp_offer(sdp: str) -> str:
             "mid": 0,
             "pts": 90000,
             "red": 100,
-            "fmtp": ["99apt=126", "101apt=100"],
+            "fmtp": ["99 apt=126", "101 apt=100"],
             "rtx": [99, 101],
             "dc": 0,
             "sc": [video_ssrc, video_rtx_ssrc],
-            "md": "LoVID",
+            "md": "Lo VID",
             "pt": 126,
             "fec": 102,
             "m": 9,
@@ -807,13 +842,11 @@ def compact_sdp_offer(sdp: str) -> str:
             "fb": 126,
         },
     }
-    # The official offer uses a bare LF (30 30 0a). Only compact answers use
-    # CRLF; the camera silently drops offers carrying that answer marker.
-    return "00\n" + json.dumps(payload, separators=(",", ":"))
+    return "00\r\n" + json.dumps(payload, separators=(",", ":"))
 
 
 def compact_outbound_candidate(candidate: LocalIceCandidate) -> str:
-    """encode the numeric, space-free ICE dialect emitted by Nooie's SDK."""
+    """Encode the numeric ICE candidate shape emitted by Nooie's SDK."""
     fields = candidate.sdp.split()
     if (
         len(fields) < 8
@@ -857,10 +890,19 @@ def compact_outbound_candidate(candidate: LocalIceCandidate) -> str:
             "10",
         ]
     )
-    return "".join(output)
+    return " ".join(output)
 
 
 def expand_compact_candidate(value: str) -> str:
+    value = value.strip()
+    if value.startswith("candidate:"):
+        value = value[len("candidate:") :]
+    if " " in value:
+        fields = value.split()
+        if len(fields) < 8 or fields[6].lower() != "typ":
+            raise ValueError(f"unsupported ICE candidate: {value!r}")
+        return " ".join(fields)
+
     match = re.fullmatch(
         r"(?P<foundation>\d+)(?P<component>[12])"
         r"(?P<protocol>udp|tcp)(?P<body>.+)",
@@ -957,7 +999,11 @@ def compact_sdp_answer(value: str) -> str:
     common = payload["com"]
 
     fingerprint = str(common["ft"])
-    fingerprint = fingerprint.replace("sha-256", "sha-256 ", 1)
+    algorithm, separator, digest = fingerprint.partition(" ")
+    if separator:
+        fingerprint = f"{algorithm} {digest.lstrip()}"
+    elif fingerprint.startswith("sha-256"):
+        fingerprint = fingerprint.replace("sha-256", "sha-256 ", 1)
     candidate = expand_compact_candidate(str(common["ic"]))
     ice_ufrag = str(common["u"])
     ice_pwd = str(common["p"])
@@ -1071,31 +1117,14 @@ def signalling_offer(
             "Timestamp": 0,
             "CodecMode": 1,
             "Quality": 1,
-            "EnableSpeaker": 0,
-            "EnableMic": 0,
+            "EnableSpeaker": False,
+            "EnableMic": False,
             "Prepare": 0,
             "dtlsTimeOut": 2000,
             "onlyRelay": 0,
         },
     }
     return envelope
-
-
-def signalling_reset(
-    config: Config,
-    call: SignallingCall,
-) -> dict[str, Any]:
-    """Clear any stale device call before establishing a new session."""
-    return {
-        "method": "service.Close",
-        "msg_id": call.next_message_id(),
-        "ver": "1.0",
-        "time": int(time.time()),
-        "origin": 1,
-        "uuid": config.device_id,
-        "device_model": config.model_id,
-        "data": {},
-    }
 
 
 def signalling_switch(
@@ -1107,7 +1136,7 @@ def signalling_switch(
         "method": "service.Switch",
         "msg_id": call.next_message_id(),
         "ver": "1.0",
-        "time": int(time.time()),
+        "tme": int(time.time()),
         "origin": 1,
         "uuid": config.device_id,
         "device_model": config.model_id,
@@ -1197,63 +1226,6 @@ def matching_signal(
     return None
 
 
-def signal_summary(message: Any) -> str:
-    methods = sorted(
-        {
-            str(item["method"])
-            for item in nested_dicts(message)
-            if item.get("method")
-        }
-    )
-    top_keys = sorted(message) if isinstance(message, dict) else []
-    status = ""
-    if isinstance(message, dict) and "code" in message:
-        status = (
-            f", code={message.get('code')!r}, "
-            f"method={message.get('method')!r}, msg={message.get('msg')!r}, "
-            f"data_type={type(message.get('data')).__name__}"
-        )
-    switch_values = []
-    if any("Switch" in method for method in methods):
-        for item in nested_dicts(
-            message.get("data") if isinstance(message, dict) else None
-        ):
-            for key, value in item.items():
-                if isinstance(value, (bool, int, float)):
-                    switch_values.append(f"{key}={value}")
-        if switch_values:
-            status += ", values=" + "/".join(sorted(set(switch_values)))
-    return f"keys={top_keys}, methods={methods}{status}"
-
-
-def sdp_media_summary(sdp: str) -> str:
-    sections = []
-    for line in sdp.splitlines():
-        if line.startswith("m="):
-            sections.append(line.split(maxsplit=1)[0])
-        elif line.startswith("a=mid:") and sections:
-            sections[-1] += f"/{line[6:]}"
-        elif line in {
-            "a=inactive",
-            "a=recvonly",
-            "a=sendonly",
-            "a=sendrecv",
-        } and sections:
-            sections[-1] += f"/{line[2:]}"
-    return ", ".join(sections)
-
-
-def sdp_codec_summary(sdp: str) -> str:
-    codecs = []
-    media = ""
-    for line in sdp.splitlines():
-        if line.startswith("m="):
-            media = line[2:].split(maxsplit=1)[0]
-        elif line.startswith("a=rtpmap:"):
-            codecs.append(f"{media}:{line[9:]}")
-    return ", ".join(codecs)
-
-
 def video_ssrc(sdp: str) -> int | None:
     description = SessionDescription.parse(sdp)
     for media in description.media:
@@ -1280,8 +1252,8 @@ async def activate_video(peer: RTCPeerConnection) -> None:
 
 
 def remote_candidate(data: dict[str, Any]) -> RTCIceCandidate | None:
-    # device trickle arrives as event.IceCandidate with a compact, space-free
-    # WebrtcCandidate; ordinary answers use a normal "candidate" field.
+    # Device trickle may arrive either space-separated or in the older
+    # space-free representation; ordinary answers use a "candidate" field.
     candidate_sdp = data.get("candidate") or data.get("WebrtcCandidate")
     if not candidate_sdp:
         return None
@@ -1305,14 +1277,10 @@ async def receive(
     enable_rsa_dtls()
     enable_nooie_ice_credentials()
     # publish our nat mapping on the p2p network so the camera can reach us.
-    # `reg` keeps its udp socket open for the duration of the call.
+    # Keep the registration object and its UDP socket alive for the call.
     print("registering on the p2p network", flush=True)
-    reg = await asyncio.to_thread(apeman.register, config.uid)
-    print(
-        f"registered p2p mapping: wan {reg.wan_ip}:{reg.wan_port} "
-        f"lan {reg.lan_ip}:{reg.lan_port}",
-        flush=True,
-    )
+    _registration = await asyncio.to_thread(apeman.register, config.uid)
+    print("p2p registration complete", flush=True)
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(
         timeout=timeout,
@@ -1325,9 +1293,7 @@ async def receive(
         ws_headers = {
             "uid": config.uid,
             "appid": config.app_id,
-            "api_token": os.environ.get(
-                "NOOIE_WS_API_TOKEN", config.api_token
-            ),
+            "api_token": config.api_token,
             "phone_code": config.phone_code,
             "Origin": websocket_origin(config.ws_url),
         }
@@ -1336,12 +1302,6 @@ async def receive(
             config.ws_url, headers=ws_headers, heartbeat=20
         ) as websocket:
             call = SignallingCall()
-            await websocket.send_json(
-                signalling_reset(config, call),
-                dumps=lambda value: json.dumps(
-                    value, separators=(",", ":")
-                ),
-            )
             print("creating Nooie WebRTC session", flush=True)
             session = await create_session(http, config)
             peer = RTCPeerConnection(
@@ -1386,9 +1346,9 @@ async def receive(
                     call,
                     compact_sdp_offer(peer.localDescription.sdp),
                 )
-                await websocket.send_json(frame, dumps=lambda value: json.dumps(
-                    value, separators=(",", ":")
-                ))
+                await websocket.send_json(
+                    frame, dumps=websocket_json_dumps
+                )
                 for local_candidate in local_candidates(
                     peer.localDescription.sdp
                 ):
@@ -1399,9 +1359,7 @@ async def receive(
                             call,
                             local_candidate,
                         ),
-                        dumps=lambda value: json.dumps(
-                            value, separators=(",", ":")
-                        ),
+                        dumps=websocket_json_dumps,
                     )
                 print("offer sent; waiting for camera answer", flush=True)
                 deadline = time.monotonic() + 30
@@ -1420,10 +1378,6 @@ async def receive(
                                 "received non-JSON WebSocket text", flush=True
                             )
                             continue
-                        print(
-                            "WebSocket message: " + signal_summary(value),
-                            flush=True,
-                        )
                         signal = matching_signal(
                             value, call.call_id, session["session_id"]
                         )
@@ -1440,24 +1394,6 @@ async def receive(
                             if answer_sdp:
                                 answer_sdp = compact_sdp_answer(
                                     str(answer_sdp)
-                                )
-                                print(
-                                    "SDP media: offer="
-                                    + sdp_media_summary(
-                                        peer.localDescription.sdp
-                                    )
-                                    + ", answer="
-                                    + sdp_media_summary(answer_sdp),
-                                    flush=True,
-                                )
-                                print(
-                                    "SDP codecs: offer="
-                                    + sdp_codec_summary(
-                                        peer.localDescription.sdp
-                                    )
-                                    + ", answer="
-                                    + sdp_codec_summary(answer_sdp),
-                                    flush=True,
                                 )
                                 await peer.setRemoteDescription(
                                     RTCSessionDescription(
@@ -1489,21 +1425,13 @@ async def receive(
                     )
                 await websocket.send_json(
                     signalling_switch(config, session, call),
-                    dumps=lambda value: json.dumps(
-                        value, separators=(",", ":")
-                    ),
+                    dumps=websocket_json_dumps,
                 )
                 print("live stream requested", flush=True)
                 try:
                     async with asyncio.timeout(2):
-                        switch_message = await websocket.receive()
-                    if switch_message.type == aiohttp.WSMsgType.TEXT:
-                        value = json.loads(switch_message.data)
-                        print(
-                            "switch response: " + signal_summary(value),
-                            flush=True,
-                        )
-                except (TimeoutError, json.JSONDecodeError):
+                        await websocket.receive()
+                except TimeoutError:
                     pass
                 await activate_video(peer)
                 print("video receiver activated", flush=True)
@@ -1523,11 +1451,6 @@ async def receive(
                             value = json.loads(status_message.data)
                         except json.JSONDecodeError:
                             continue
-                        print(
-                            "WebSocket message: "
-                            + signal_summary(value),
-                            flush=True,
-                        )
                         if any(
                             "SwitchResp" in method
                             for method in {
@@ -1544,8 +1467,12 @@ async def receive(
                 print(
                     "inbound RTP: "
                     + ", ".join(
-                        f"{report.kind}={report.packetsReceived} packets/"
-                        f"{report.bytesReceived} bytes"
+                        f"{report.kind}={report.packetsReceived} packets"
+                        + (
+                            f"/{report.bytesReceived} bytes"
+                            if hasattr(report, "bytesReceived")
+                            else ""
+                        )
                         for report in inbound
                     ),
                     flush=True,
@@ -1557,9 +1484,7 @@ async def receive(
                     try:
                         await websocket.send_json(
                             signalling_close(config, session, call),
-                            dumps=lambda value: json.dumps(
-                                value, separators=(",", ":")
-                            ),
+                            dumps=websocket_json_dumps,
                         )
                     except (aiohttp.ClientError, ConnectionError):
                         pass
@@ -1629,6 +1554,11 @@ def parse_args() -> argparse.Namespace:
         description="receive live A/V from your Nooie camera over its WebRTC path"
     )
     parser.add_argument(
+        "username",
+        nargs="?",
+        help="Nooie account username/email (password is prompted)",
+    )
+    parser.add_argument(
         "--output", type=Path, default=Path("nooie.mp4"), help="recording path"
     )
     parser.add_argument(
@@ -1645,6 +1575,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     load_dotenv()
+    if args.username:
+        os.environ["NOOIE_USERNAME"] = args.username
+        if not os.environ.get("NOOIE_PASSWORD"):
+            os.environ["NOOIE_PASSWORD"] = getpass("Nooie password: ")
     if args.check_config:
         login_environment()
         app_credentials()

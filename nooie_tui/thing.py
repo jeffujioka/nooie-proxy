@@ -58,6 +58,11 @@ UUID_PATTERN = re.compile(
     r"[0-9A-F]{4}-[0-9A-F]{12}$"
 )
 
+DEFAULT_THING_APP_KEY = "kvradrme9pmyjckdd7ws"
+DEFAULT_THING_APP_SECRET = "jmaj939wk95awxur9xe7trgpwnyddpu8"
+DEFAULT_THING_SECRET_PIC_KEY = "8ey4j8m7dsx8qtvpnrdhfwqn7p4gv579"
+DEFAULT_THING_BUNDLE_ID = "com.nooie.home"
+
 
 class ThingError(RuntimeError):
     """A redaction-safe Thing protocol error."""
@@ -65,7 +70,7 @@ class ThingError(RuntimeError):
 
 @dataclass(frozen=True)
 class ThingApp:
-    """Shared SDK material extracted from an app bundle owned by the user."""
+    """Shared configuration for the Thing SDK bundled with Nooie."""
 
     app_key: str
     app_secret: str
@@ -235,7 +240,7 @@ def local_time_zone_id() -> str:
 
 
 def thing_app_from_environment() -> ThingApp:
-    """Load Thing material from individual variables or a private JSON file."""
+    """Load bundled Thing material, allowing overrides for future rotation."""
     material_file = os.environ.get("NOOIE_THING_MATERIAL_FILE", "")
     material: dict[str, Any] = {}
     if material_file:
@@ -254,23 +259,37 @@ def thing_app_from_environment() -> ThingApp:
             raise SystemExit(f"{path} must contain a JSON object")
         material = loaded
 
-    app_key = os.environ.get(
-        "NOOIE_THING_APP_KEY", str(material.get("app_key", ""))
+    def configured_value(
+        environment_name: str,
+        material_names: tuple[str, ...],
+        default: str,
+    ) -> str:
+        configured = os.environ.get(environment_name, "")
+        if configured:
+            return configured
+        for name in material_names:
+            value = material.get(name)
+            if isinstance(value, str) and value:
+                return value
+        return default
+
+    app_key = configured_value(
+        "NOOIE_THING_APP_KEY", ("app_key",), DEFAULT_THING_APP_KEY
     )
-    app_secret = os.environ.get(
-        "NOOIE_THING_APP_SECRET", str(material.get("app_secret", ""))
+    app_secret = configured_value(
+        "NOOIE_THING_APP_SECRET",
+        ("app_secret",),
+        DEFAULT_THING_APP_SECRET,
     )
-    secret_pic_key = os.environ.get(
+    secret_pic_key = configured_value(
         "NOOIE_THING_SECRET_PIC_KEY",
-        str(
-            material.get(
-                "secret_pic_key", material.get("bmp_key", "")
-            )
-        ),
+        ("secret_pic_key", "bmp_key"),
+        DEFAULT_THING_SECRET_PIC_KEY,
     )
-    bundle_id = os.environ.get(
+    bundle_id = configured_value(
         "NOOIE_THING_BUNDLE_ID",
-        str(material.get("bundle_id", "com.nooie.home")),
+        ("bundle_id",),
+        DEFAULT_THING_BUNDLE_ID,
     )
     api_url = os.environ.get(
         "NOOIE_THING_API_URL", "https://a1.tuyaeu.com/api.json"
@@ -286,7 +305,7 @@ def thing_app_from_environment() -> ThingApp:
         raise SystemExit(
             "missing Thing configuration: "
             + ", ".join(missing)
-            + " (set NOOIE_THING_* or NOOIE_THING_MATERIAL_FILE)"
+            + " (update the bundled defaults or set NOOIE_THING_*)"
         )
     if not api_url.startswith("https://"):
         raise SystemExit("NOOIE_THING_API_URL must use HTTPS")
@@ -755,11 +774,7 @@ async def mqtt_presence(
     )
     try:
         async with client:
-            print(
-                f"connected to Thing MQTT at "
-                f"{session.mqtt_host}:{session.mqtt_port}",
-                flush=True,
-            )
+            print("connected to Thing MQTT", flush=True)
             topics = mqtt_topics(session)
             for topic in topics:
                 result = await client.subscribe(topic, qos=1)

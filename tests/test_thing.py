@@ -23,6 +23,7 @@ from nooie_tui.thing import (
     mqtt_topics,
     rsa_encrypt_password,
     sign_request,
+    thing_app_from_environment,
 )
 
 APP = ThingApp(
@@ -52,6 +53,15 @@ SESSION = ThingSession(
 
 
 class ThingProtocolTests(unittest.TestCase):
+    def test_shared_thing_material_has_built_in_defaults(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            app = thing_app_from_environment()
+
+        self.assertTrue(app.app_key)
+        self.assertTrue(app.app_secret)
+        self.assertTrue(app.secret_pic_key)
+        self.assertEqual(app.bundle_id, "com.nooie.home")
+
     def test_payload_encryption_round_trips(self) -> None:
         wrapper = {
             "success": True,

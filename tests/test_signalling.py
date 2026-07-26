@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import patch
 
@@ -6,7 +7,9 @@ from aioice import Connection
 from nooie_tui.client import (
     Config,
     SignallingCall,
+    app_credentials,
     client_registration,
+    compact_sdp_answer,
     compact_sdp_offer,
     enable_nooie_ice_credentials,
     ice_servers,
@@ -14,8 +17,8 @@ from nooie_tui.client import (
     login_request_body,
     signalling_candidate,
     signalling_offer,
-    signalling_reset,
     signalling_switch,
+    websocket_json_dumps,
     websocket_origin,
 )
 
@@ -42,10 +45,44 @@ SESSION = {
 
 
 class SignallingTests(unittest.TestCase):
+    def test_shared_app_credentials_have_built_in_defaults(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            app_id, app_secret = app_credentials()
+
+        self.assertTrue(app_id)
+        self.assertTrue(app_secret)
+
     def test_websocket_origin_matches_socketrocket(self) -> None:
         self.assertEqual(
             websocket_origin("wss://wss.eu.nooie.com/ws"),
             "https://wss.eu.nooie.com",
+        )
+
+    def test_websocket_json_matches_foundation_pretty_format(self) -> None:
+        value = {
+            "z": "a/b",
+            "data": {},
+            "items": ["one", "two"],
+            "enabled": True,
+        }
+
+        self.assertEqual(
+            websocket_json_dumps(value),
+            "\n".join(
+                [
+                    "{",
+                    '  "data" : {',
+                    "",
+                    "  },",
+                    '  "enabled" : true,',
+                    '  "items" : [',
+                    '    "one",',
+                    '    "two"',
+                    "  ],",
+                    '  "z" : "a\\/b"',
+                    "}",
+                ]
+            ),
         )
 
     def test_login_and_registration_use_distinct_official_brand_fields(
@@ -144,8 +181,7 @@ class SignallingTests(unittest.TestCase):
 
     def test_call_uses_one_monotonic_message_sequence(self) -> None:
         call = SignallingCall(call_uuid="12345678-90AB-CDEF-1234-567890ABCDEF")
-        reset = signalling_reset(CONFIG, call)
-        offer = signalling_offer(CONFIG, SESSION, call, "00\n{}")
+        offer = signalling_offer(CONFIG, SESSION, call, "00\r\n{}")
         candidates = local_candidates(
             "\r\n".join(
                 [
@@ -166,29 +202,27 @@ class SignallingTests(unittest.TestCase):
         switch = signalling_switch(CONFIG, SESSION, call)
 
         self.assertEqual(call.call_id, "iOS_12345678-90A")
-        self.assertEqual(reset["method"], "service.Close")
-        self.assertEqual(reset["data"], {})
-        self.assertTrue(reset["msg_id"].endswith("_1001"))
-        self.assertEqual(offer["msg_id"], "iOS_12345678-90A_1002")
+        self.assertEqual(offer["msg_id"], "iOS_12345678-90A_1001")
+        self.assertIs(offer["data"]["EnableMic"], False)
+        self.assertIs(offer["data"]["EnableSpeaker"], False)
         self.assertTrue(candidate["msg_id"].startswith("iOS_"))
-        self.assertTrue(candidate["msg_id"].endswith("_1003"))
+        self.assertTrue(candidate["msg_id"].endswith("_1002"))
         self.assertTrue(switch["msg_id"].startswith("iOS_"))
-        self.assertTrue(switch["msg_id"].endswith("_1004"))
-        self.assertNotIn(" ", candidate["data"]["WebrtcCandidate"])
+        self.assertTrue(switch["msg_id"].endswith("_1003"))
         self.assertRegex(
             candidate["data"]["WebrtcCandidate"],
-            r"^candidate:\d+1udp2122260223",
+            r"^candidate:\d+ 1 udp 2122260223 ",
         )
         self.assertIn(
-            "typhostgeneration0ufragabcdenetwork-id1network-cost10",
+            "typ host generation 0 ufrag abcde network-id 1 network-cost 10",
             candidate["data"]["WebrtcCandidate"],
         )
         self.assertEqual(candidate["data"]["WebrtcSdpMid"], "0")
         self.assertEqual(candidate["data"]["WebrtcSdpMLineIndex"], 0)
-        self.assertIn("time", switch)
-        self.assertNotIn("tme", switch)
+        self.assertIn("tme", switch)
+        self.assertNotIn("time", switch)
 
-    def test_compact_offer_uses_ios_bare_lf_marker(self) -> None:
+    def test_compact_offer_matches_decrypted_ios_shape(self) -> None:
         sdp = "\r\n".join(
             [
                 "o=- 12345 2 IN IP4 127.0.0.1",
@@ -199,8 +233,69 @@ class SignallingTests(unittest.TestCase):
             ]
         )
 
-        self.assertTrue(compact_sdp_offer(sdp).startswith("00\n{"))
-        self.assertFalse(compact_sdp_offer(sdp).startswith("00\r\n{"))
+        compact = compact_sdp_offer(sdp)
+        payload = json.loads(compact[4:])
+
+        self.assertTrue(compact.startswith("00\r\n{"))
+        self.assertRegex(
+            payload["com"]["iO"],
+            r"^ \d{19} 2 IN IP4 127\.0\.0\.1$",
+        )
+        self.assertEqual(payload["com"]["o"], "trickle renomination")
+        self.assertEqual(payload["com"]["I"], " IP4 0.0.0.0")
+        self.assertEqual(payload["com"]["iT"], "0 0")
+        self.assertEqual(payload["com"]["iG"], "0 1")
+        self.assertEqual(payload["com"]["ft"], "sha-256 AA:BB")
+        self.assertEqual(payload["audio"]["md"], "Lo AID")
+        self.assertEqual(payload["video"]["md"], "Lo VID")
+        self.assertEqual(
+            payload["video"]["fmtp"],
+            ["99 apt=126", "101 apt=100"],
+        )
+
+    def test_compact_answer_accepts_space_separated_ios_candidate(self) -> None:
+        answer = {
+            "com": {
+                "ft": "sha-256 AA:BB",
+                "ic": (
+                    "0 1 udp 2130706431 192.0.2.10 50000 typ host "
+                    "raddr 0.0.0.0 rport 0 generation 0 ufrag abcd "
+                    "network-cost 999"
+                ),
+                "u": "abcd",
+                "p": "answer-password",
+                "s": "active",
+            },
+            "video": {
+                "pt": 126,
+                "sc": "1234",
+                "ce": "video-cname",
+                "m": 9,
+                "mid": 0,
+                "pts": 90000,
+            },
+            "audio": {
+                "pt": 96,
+                "sc": "5678",
+                "ce": "audio-cname",
+                "m": 9,
+                "mid": 1,
+                "pts": 16000,
+            },
+        }
+
+        sdp = compact_sdp_answer(
+            "00\r\n" + json.dumps(answer, separators=(",", ":"))
+        )
+
+        self.assertIn("a=fingerprint:sha-256 AA:BB\r\n", sdp)
+        self.assertNotIn("sha-256  AA:BB", sdp)
+        self.assertIn(
+            "a=candidate:0 1 udp 2130706431 192.0.2.10 50000 "
+            "typ host raddr 0.0.0.0 rport 0 generation 0 "
+            "ufrag abcd network-cost 999\r\n",
+            sdp,
+        )
 
     def test_ice_credentials_match_ios_lengths(self) -> None:
         enable_nooie_ice_credentials()
