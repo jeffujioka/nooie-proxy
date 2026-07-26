@@ -1,0 +1,848 @@
+# Progress: `Ret=8` / independent Thing login
+
+Updated: 2026-07-26 16:39 BST
+
+## Stop point and current direction
+
+Live video is still blocked: the CLI reaches `response.SdpAnswer`, but the
+camera returns `Ret: 8` without SDP.
+
+The investigation has moved beyond offer/ICE tuning. A fresh official-app login
+proved that Nooie performs a second, separate Thing/Tuya UID login and opens a
+persistent Tuya MQTT connection before attempting video. The CLI does neither.
+
+The agreed target is an app-independent implementation: perform the complete
+Thing/Tuya login and MQTT bootstrap inside `nooie-tui`. Reusing an official-app
+token or keeping the app online was diagnostic only and is not the intended
+solution.
+
+No Thing/Tuya implementation has been added yet. The cryptographic recovery
+barrier is now cleared: both captured login requests and responses decrypt, and
+the captured request signature is reproduced byte-for-byte. Work is currently
+stopped immediately before turning the validated protocol into a dedicated
+Thing client and completing the MQTT bootstrap.
+
+## Decisive evidence from the fresh login
+
+Capture: `nooie-official-login-live.pcap` (about 1.5 MB / 2,265 packets).
+
+The successful official login on 2026-07-26 followed this sequence:
+
+```text
+13:49:57.019  Nooie /login/login request
+13:49:57.198  Nooie login response
+13:49:57.236  internal route yrcx://yrtuyaaccountservice/c/loginnooie
+13:49:57.237  Tuya smartlife.m.user.uid.token.create
+13:49:57.336  Tuya smartlife.m.user.uid.password.login
+13:49:57.468  TCP/TLS connection begins to m1.tuyaeu.com:8883
+```
+
+The two Tuya HTTP calls go to `https://a1.tuyaeu.com/api.json`. The token-create
+request body is 855 bytes and its JSON response body is 966 bytes. The UID login
+request body is 1,361 bytes and its JSON response body is 2,014 bytes. The MQTT
+connection is established before the later video offer and remains alive after
+leaving live view.
+
+Static Objective-C metadata establishes the credential mapping:
+
+```text
+YRTuyaAccountService loginnooie
+  -> decrypt routed password (app routing key: osaio123ABC)
+  -> ThingSmartUser loginByUid:password:countryCode:
+```
+
+The values supplied are the Nooie UID, the user's Nooie password, and the
+normal country code. This matches Tuya's documented UID-login bridge for apps
+that retain their own account system:
+
+https://developer.tuya.com/en/docs/app-development/iOS-user-uid?id=Kaixtsekab9s1
+
+## What is now ruled out
+
+- **A busy camera is not the general cause.** A known-idle run still returned
+  `Ret=8`.
+- **Nooie token freshness alone is not enough.** Reusing the exact current
+  official-app Nooie token with a separate `phone_code` produced a stable
+  signalling WebSocket but still returned `Ret=8`.
+- **Account-level MQTT presence is not enough.** That test ran while the
+  official app's Tuya MQTT connection was alive. The CLI still failed, implying
+  that admission is tied to the caller/device's own Thing session or identity.
+- Reusing the official token with the same `phone_code` displaced the app's
+  WebSocket. Nooie allows only one signalling connection per phone identity.
+- Full/compact SDP, offer fields, candidate variants, session refresh/resend,
+  bogus session IDs, pre-offer signalling messages, and exact Apeman NAT
+  registration did not change `Ret=8`.
+
+The remaining leading explanation is that the camera/cloud expects the caller's
+own authenticated Thing session and MQTT presence before accepting its WebRTC
+offer.
+
+## Validated Tuya wire format
+
+The official app uses Thing SDK 5.7.10 and the modern form-urlencoded mobile
+API dialect. The captured logged-out login requests each have 26 fields:
+
+```text
+a, v, time, requestId, clientId, deviceId, sign, postData,
+sdkVersion, deviceCoreVersion, appVersion, appRnVersion,
+bundleId, channel, os, osSystem, platform, lang, timeZoneId,
+ttid, et, nd, cp, lat, lon, bizData
+```
+
+`sid` is optional and absent from these two logged-out calls. `bizData` is
+ordinary JSON transport metadata, not the encrypted business payload.
+
+The signing and payload algorithms have now been validated against the
+preserved SDK 5.7.10 vectors:
+
+```python
+SIGNED_FIELDS = {
+    "a", "v", "lat", "lon", "et", "lang", "deviceId", "imei",
+    "imsi", "appVersion", "ttid", "isH5", "h5Token", "os",
+    "clientId", "postData", "time", "n4h5", "sid", "sp", "requestId",
+}
+
+digest = md5(encrypted_post_data).hexdigest()
+post_hash = digest[8:16] + digest[0:8] + digest[24:32] + digest[16:24]
+
+feed = "||".join(
+    f"{key}={post_hash if key == 'postData' else params[key]}"
+    for key in sorted(SIGNED_FIELDS)
+    if key in params and params[key] != ""
+)
+
+signing_key = f"{bundle_id}_{secret_pic_key}_{app_secret}"
+sign = hmac_sha256(signing_key, feed).hexdigest()
+```
+
+The captured token-create signature matches this formula exactly. There is no
+trailing app secret or separator in the HMAC message.
+
+For the ordinary `ThingRequest` path used by these login calls:
+
+```python
+key_material = f"{bundle_id}_{secret_pic_key}_{app_secret}"
+if ecode:
+    key_material += f"_{ecode}"
+
+aes_key = hmac_sha256(request_id, key_material).hexdigest()[:16].encode()
+encrypted = base64(AES-128-ECB-PKCS7(aes_key, json_payload))
+```
+
+The earlier AES-GCM hypothesis applied to the SDK's separate Fusion/Highway
+request classes, not to these `/api.json` login vectors. Both the request
+`postData` and response `result` use AES-128 ECB with PKCS#7 padding here. The
+logged-out calls use no `ecode`.
+
+## Volatile forensic evidence
+
+The app's CFURL cache journal preserved the otherwise non-cacheable login calls:
+
+```text
+~/Library/Containers/FDBC4DD6-B852-4325-B9DE-0A4F6BFE2E81/
+  Data/Library/Caches/com.nooie.home/Cache.db-wal
+```
+
+Useful current-login records:
+
+```text
+offset 728300  token-create request, requestId 5ED11BA2-...-E5995830E995
+offset 731466  token-create encrypted response
+offset 769004  UID-login request, requestId 92419E67-...-B64F3F46B4B8
+offset 771617  UID-login encrypted response
+offset 992008  first authenticated call carrying the new sid
+```
+
+The full UUIDs can be recovered from the journal. Do not paste the full request
+or response blobs into the repository: the decrypted login response will
+contain reusable Thing/MQTT credentials. The journal is volatile and may be
+overwritten when Nooie runs again.
+
+The evidence has now been copied out of the live container to a mode-0700
+directory:
+
+```text
+~/Library/Application Support/nooie-tui-forensics/
+  20260726-1545-login-cache/
+```
+
+This private snapshot contains the cache database/WAL, the original encrypted
+diagnostic log, its mode-0600 decrypted copy, the app configuration and bitmap,
+the public signing certificates, and a copy of the prior 16-snapshot workspace.
+The isolated request/response vectors are under
+`prior-session-workspace/vectors/`. It is no longer necessary to rely on the
+live WAL or `/private/tmp` copy.
+
+A passive SQLite WAL checkpoint was invoked at about 14:06 BST while inspecting
+the cache. The journal still existed afterward at 1,297,832 bytes and retained
+the records above.
+
+## Installed app and SDK findings
+
+At the stop point, the App Store build was:
+
+```text
+bundle id:       com.nooie.home
+version:         3.7.0
+Thing SDK:       5.7.10
+ephemeral path:  /private/var/folders/.../Wrapper/Nooie.app
+```
+
+`thing_custom_config.json` contains the Thing app ID, scheme, and public app
+key. The request `clientId` is different from that public app key. Do not commit
+either app credential into source until its role and redistribution implications
+are understood.
+
+The main binary contains references to:
+
+```text
+appEncryptKeyProd
+appEncryptSecretProd
+thingAppSecret
+keyCertSign
+genKey:token:secretKey:appSecretPicKey:bundleId:
+generateKey:session:secretKey:appSecretPicKey:bundleId:
+```
+
+This trail has now been completed. The request `clientId` and corresponding
+32-character SDK app secret are present together in the executable. Their
+values are intentionally omitted from this file.
+
+Persisted Thing state is also encrypted:
+
+- `kDefaultThingUserV4`: 1,120-byte blob in `com.nooie.home.plist`;
+- `kCertificateKey_V2`: base64 text decoding to 6,960 bytes;
+- keychain access group: `DX4USQYJ9S.com.nooie.home`.
+
+`kDefaultThingUserV4` has now also been decrypted. The SDK uses AES-256 CBC,
+a zero IV, and PKCS#7 padding; its 32-byte storage key is held in the executable
+under the same small XOR-obfuscated-string mechanism used elsewhere. The
+plaintext is the expected Thing user JSON, including `sid`, `ecode`, `uid`,
+`username`, domain information, and profile fields. No values from that JSON
+have been placed in the repository.
+
+## Encrypted Nooie diagnostic log
+
+The fresh login is in:
+
+```text
+~/Library/Containers/FDBC4DD6-B852-4325-B9DE-0A4F6BFE2E81/
+  Data/Documents/2026-07-26 13-16-50_yrlog_dr.log
+```
+
+The file uses Twofish ECB over 16-byte blocks with:
+
+```python
+b"thIsIStEofishLOGkEy!thIsIStEofis"
+```
+
+The temporary `twofish==0.3.0` install exists only in `.venv`; it was not added
+to project dependencies. Never dump the decrypted log wholesale: it contains
+Nooie credentials, live tokens, user IDs, and device identifiers.
+
+## Existing signalling patch
+
+`nooie_tui/client.py` remains modified with evidence-based signalling changes:
+
+- per-call message IDs and the official pre-call empty `service.Close`;
+- corrected `service.Switch` field (`time`, not `tme`);
+- TURN credentials passed to aiortc and BUNDLE-aware candidate selection;
+- official-style host/relay candidate formatting;
+- correct compact-SDP marker and media coordinates;
+- official-length ICE credentials.
+
+`tests/test_signalling.py` covers those behaviours. The last recorded checks
+passed:
+
+```text
+Ran 5 tests in 0.000s
+OK
+python -m compileall -q nooie_tui
+```
+
+These changes are not a `Ret=8` fix by themselves.
+
+## Next steps
+
+1. Recover and validate the password transform used between
+   `uid.token.create` and `uid.password.login` (the decrypted request contains
+   `passwd`, `ifencrypt`, the returned `token`, and `options.group`).
+2. Trace the post-login MQTT credential/client-ID derivation and exact
+   subscriptions from SDK 5.7.10. The login result already supplies `sid`,
+   `ecode`, username, and the regional MQTT/MQTTS endpoints and ports.
+3. Implement a dedicated Thing client that persists its own device identity,
+   performs token creation and UID/password login, opens TLS MQTT, waits for
+   successful CONNACK/subscription, and only then starts the Nooie video-call
+   flow.
+4. Add deterministic tests from sanitized versions of both captured vectors;
+   no reusable account, session, device, or app secret may enter fixtures.
+5. Test end-to-end with the official app fully quit/logged out. Success means
+   the CLI independently obtains its Thing session, connects to
+   `m1.tuyaeu.com:8883`, and receives `SdpAnswer Ret=0`.
+
+## Worktree at handoff
+
+No commit was created.
+
+```text
+ M nooie_tui/client.py
+?? PROGRESS.md
+?? apeman.pcap
+?? nooie-official-login-live.pcap
+?? tests/test_signalling.py
+```
+
+`CLAUDE-PROGRESS.md` and `GPT-PROGRESS.md` were removed as superseded. `README.md`
+and `ISSUES.md` remain as project documentation.
+
+Encrypted official-app logs contain live credentials. Extract and redact only
+the fields needed for comparison; do not publish full decrypted logs.
+
+## Continuation checkpoint — 2026-07-26, fresh login capture
+
+At the user's request, progress is now appended to this file during every
+working turn so the investigation can resume safely after an interruption.
+
+A watcher was armed before a fresh official-app logout/login. It captured 16
+successive CFURL-cache WAL states in a private mode-0700 directory outside the
+repository:
+
+```text
+/private/tmp/nooie-tui-tuya.ycOCvG/
+```
+
+The two required authenticated test vectors are now preserved:
+
+- `snapshot-0001`: `smartlife.m.user.uid.token.create`, 855-byte request
+  body and 966-byte response body;
+- `snapshot-0002`: `smartlife.m.user.uid.password.login`, 1,361-byte
+  request body and 2,014-byte response body.
+
+The isolated request archives and response bodies are under the private
+`vectors/` subdirectory. They have not been added to the worktree. Each request
+has 26 form fields; `postData` decodes to 48 bytes for token creation and 400
+bytes for UID login. The encrypted response `result` values decode to 672 and
+1,456 bytes respectively. Both responses have only `result`, `sign`, and `t`
+at the JSON top level.
+
+Static analysis made a significant advance. The App Store executable is about
+52.8 MB and only one 4 KiB page is FairPlay-encrypted
+(`cryptoff=1585152`, `cryptsize=4096`). The relevant key-derivation methods are
+outside that page and can be disassembled. Objective-C metadata identifies:
+
+```text
+ThingSecurityUtil
+  + genKey:token:secretKey:appSecretPicKey:bundleId:
+  + generateKey:session:secretKey:appSecretPicKey:bundleId:
+  + shuffleToken:prelen:
+  + cryptoSha256:secret:
+```
+
+The first two methods have identical bodies. The recovered algorithm is:
+
+1. Build `bundleId + "_" + appSecretPicKey + "_" + secretKey`.
+2. If `token`/`session` is non-empty, take its first 16 characters and map each
+   character `c` to `token[ord(c) % 16]`; append that 16-character shuffle to
+   the material with an underscore.
+3. Compute HMAC-SHA256 over that material, using the first method argument as
+   the HMAC key.
+4. Hex-encode in lowercase and take the first 16 characters.
+
+The order in step 1 follows Darwin arm64's stack convention for Objective-C
+variadic arguments and the method's `%@_%@_%@` format. `cryptoSha256:secret:`
+calls `CCHmac` with algorithm 2 (SHA-256) and emits bytes with `%02x`.
+`shuffleToken:prelen:` was also reconstructed instruction by instruction.
+
+This formula is structurally recovered but not yet authenticated against an
+AES-GCM tag. The next task is to locate callers of the two public derivation
+methods, identify which captured field supplies the first argument and which
+persisted/generated values supply `secretKey` and `appSecretPicKey`, then
+validate candidate keys against both response vectors. A whole-binary radare2
+cross-reference pass was abandoned after it remained non-responsive; use a
+targeted ARM64 selector-reference scan instead.
+
+## Continuation checkpoint — 2026-07-26, certificate and security-image tracing
+
+The targeted ARM64 selector-reference scan succeeded where the whole-binary
+radare2 analysis did not. It resolved the selector stubs and all four relevant
+call sites:
+
+```text
+genKey:       stub 0x101f1f800, calls 0x1016359a8 and 0x101636a48
+generateKey:  stub 0x101f1ff20, calls 0x101633a28 and 0x101634950
+```
+
+Register/data-flow tracing at those callers confirms that the derivation is
+wired to the request-scoped first argument plus
+`ThingCustomConfig.secretKey`, `.secretPicKey`, and `.bundleId`. This closes
+the earlier caller-mapping question, although the resulting key has still not
+been authenticated against either preserved AES-GCM vector.
+
+The relevant persisted defaults were copied into the existing private
+mode-0700 workspace:
+
+```text
+/private/tmp/nooie-tui-tuya.ycOCvG/state/
+```
+
+Static analysis found the `kCertificateKey_V2` decryptor and its 32-byte
+internal AES key. The key is stored in the executable under a simple in-place
+XOR obfuscation; its raw value has deliberately not been written here. Tracing
+the `thingsdk_aes256DecryptWithKey:` wrapper allowed the certificate state to
+be decrypted offline:
+
+```text
+input text:  9,280 hexadecimal characters
+ciphertext:  4,640 bytes
+plaintext:   4,634 bytes of JSON
+root:        list with 16 entries
+output:      state/certificate-v2.json
+```
+
+This corrects the earlier provisional base64 interpretation of
+`kCertificateKey_V2`: the SDK treats the stored text as hex, producing 4,640
+ciphertext bytes. The decrypted data is a collection of domain/certificate
+records and did not directly expose the `secretKey` or `secretPicKey`.
+`kDefaultThingUserV4` remains an unopened 1,120-byte high-entropy archive.
+None of these private state artifacts has been added to the repository.
+
+Objective-C metadata and initialization flow further identify:
+
+```text
+YRAppConfiguration
+YRNooieConfiguration
+YRNooieCNConfiguration
+YROsaioConfiguration
+tyappKey
+tyappSecret
+startWithAppKey:secretKey:
+```
+
+The Nooie configuration supplies the ordinary app key/secret side of SDK
+startup. The remaining hidden picture-key path leads to the installed bundle:
+
+```text
+/Applications/Nooie.app/Wrapper/Nooie.app/
+  ThingSmartCryption.bundle/t_s.bmp
+```
+
+The SDK locates that asset using the names `ThingSmartCryption`, `t_s`,
+`thingsdk`, and `bundlecfg`. The recovered path takes the first string decoded
+from the bitmap, converts its hexadecimal pairs to bytes, and constructs a
+UTF-8 string. That output is the strongest current lead for
+`ThingCustomConfig.secretPicKey`.
+
+Two public reverse-engineering implementations were found that document the
+same Tuya/Thing security-image format:
+
+- `nalajcie/tuya-sign-hacking`, especially `read-keys-from-bmp/read_keys.c`
+  and `coeffs_to_key.c`;
+- `eisbaw/babymonitor-client`, especially
+  `re/scripts/bmp_token_ghidra.py` and the adjacent Ghidra-derived routines.
+
+The latter is described as a byte-exact Python port of the bitmap
+imath/bignum-and-matrix decoder. A local validation harness was started using
+the app-key CFString located in the Nooie executable and the installed
+`t_s.bmp`, but the harness failed before producing decoder output. Therefore no
+bitmap-derived key has yet been claimed or recorded.
+
+The next concrete steps are:
+
+1. Repair the decoder harness and run the byte-exact implementation against
+   the installed `t_s.bmp`, initially recording only output lengths and hashes.
+2. Confirm which decoded field becomes `secretPicKey`, and finish mapping the
+   Nooie `tyappSecret` value to `ThingCustomConfig.secretKey`.
+3. Recompute the recovered `ThingSecurityUtil` derivation for both preserved
+   vectors and accept a candidate only when AES-GCM tag verification succeeds.
+4. Decrypt and inspect only the minimum login fields needed for the client,
+   keeping reusable account and MQTT credentials out of the repository.
+
+## Continuation checkpoint — 2026-07-26 16:39 BST, crypto validated
+
+This checkpoint supersedes the provisional AES-GCM and unopened-bitmap notes
+above. No secret value, password, token, session, user ID, or device ID is
+included here.
+
+### Evidence preservation
+
+The live cache contents and the surviving `/private/tmp` analysis workspace
+were copied to:
+
+```text
+~/Library/Application Support/nooie-tui-forensics/
+  20260726-1545-login-cache/
+```
+
+Directory permissions are `0700`; decrypted/sensitive files are `0600`.
+Important contents are:
+
+```text
+Cache.db, Cache.db-wal, Cache.db-shm
+2026-07-26 13-16-50_yrlog_dr.log
+2026-07-26 13-16-50_yrlog_dr.decrypted.log
+t_s.bmp
+thing_custom_config.json
+signing-cert-0, signing-cert-1, signing-cert-2
+prior-session-workspace/vectors/
+prior-session-workspace/state/
+thing-material.private.json
+```
+
+`thing-material.private.json` is outside the repository and mode `0600`. It
+contains the extracted app key, app secret, picture key, bundle ID, public
+certificate hashes, and version metadata. It must never be copied into a
+fixture, issue, log, commit, or final user-facing output.
+
+### SDK 5.7.10 bitmap format and `secretPicKey`
+
+The installed stable bundle is
+`/Applications/Nooie.app/Wrapper/Nooie.app`; the security image is
+`ThingSmartCryption.bundle/t_s.bmp` (100x75, 24-bit BMP, 22,554 bytes).
+
+The older public decoder failed because SDK 5.7.10 uses bitmap format version
+2. Targeted disassembly of the native reader at `0x101504a08` recovered the
+format:
+
+1. Compute the signed Java-style `31 * hash + char` app-key hash, take its
+   absolute value, then use `(hash % pixel_length) // 2`.
+2. The byte at that pixel index is the format version (`2`).
+3. Subsequent logical bytes are encoded in the low bit of eight consecutive
+   pixel bytes, least-significant bit first.
+4. The header gives one output key and four polynomial point pairs.
+5. Each point is encoded as a byte length followed by LSB-packed bytes. In this
+   image, each x-coordinate is four bytes and each y-coordinate is 32 bytes.
+6. Arbitrary-precision rational interpolation at x=0 produces a 32-byte
+   constant.
+7. Format version 2 passes those bytes through an additional fixed native
+   24-byte-block transform at `0x101505710`.
+
+The transform was executed offline under temporary ARM64 emulation, using only
+the relevant code/constant pages from the installed executable. Its output is
+valid printable UTF-8 of length 32, matching the `ThingSmartCore` conversion
+path. This is the validated `secretPicKey`. The temporary Unicorn package is
+under `/tmp/nooie-unicorn-20260726`; it is not a project dependency.
+
+The request `clientId` is the real SDK startup app key. It differs from the
+public-looking `thingAppKey` in `thing_custom_config.json`. The matching
+32-character SDK app secret is stored adjacent to the client ID in the
+executable. Both are retained only in the private material file.
+
+### Exact signature reproduction
+
+The token-create request's 64-character HMAC-SHA256 signature now reproduces
+exactly. The signed whitelist is:
+
+```text
+a, v, lat, lon, et, lang, deviceId, imei, imsi, appVersion, ttid,
+isH5, h5Token, os, clientId, postData, time, n4h5, sid, sp, requestId
+```
+
+Only present, non-empty values are included, sorted by field name and joined
+with `||`. Before inclusion, `postData` is replaced by the rearranged lowercase
+MD5:
+
+```text
+md5[8:16] + md5[0:8] + md5[24:32] + md5[16:24]
+```
+
+The HMAC key is:
+
+```text
+bundleId + "_" + secretPicKey + "_" + appSecret
+```
+
+There is no secret suffix in the HMAC message.
+
+### Exact login-payload encryption and decrypted vector shapes
+
+The captured login calls use the ordinary `ThingRequest` class, not the
+Fusion/Highway AES-GCM classes. Static tracing and vector validation establish:
+
+```text
+keyMaterial = bundleId + "_" + secretPicKey + "_" + appSecret
+if ecode is non-empty:
+    keyMaterial += "_" + ecode
+
+digest = HMAC-SHA256(key=requestId, message=keyMaterial).hexdigest()
+aesKey = first 16 ASCII characters of digest
+cipher = AES-128 ECB with PKCS#7 padding
+wireValue = standard Base64(ciphertext)
+```
+
+Using an empty `ecode` authenticates and decrypts all four captured encrypted
+values:
+
+- token-create request `postData`;
+- token-create response `result`;
+- UID-login request `postData`;
+- UID-login response `result`.
+
+The decrypted token-create request contains only `uid` and `countryCode`. Its
+decrypted result wrapper contains `result`, `status`, `success`, and `t`; nested
+`result` contains:
+
+```text
+exponent, pbKey, publicKey, token
+```
+
+The decrypted UID-login request contains:
+
+```text
+uid, countryCode, passwd, ifencrypt, token, options
+options.group
+```
+
+The decrypted UID-login response uses the same wrapper and its nested `result`
+contains:
+
+```text
+accountType, attribute, dataVersion, domain, ecode, email, extras,
+headPic, mobile, nickname, partnerIdentity, phoneCode, receiver,
+regFrom, sex, sid, snsNickname, tempUnit, timezone, timezoneId,
+uid, userAlias, userType, username
+```
+
+The session field lengths agree with the persisted model (`sid` 56 characters,
+`ecode` 16, UID 20, username 16). `receiver` is empty in this response.
+`domain` contains 24 regional endpoints/settings, including `mobileMqttUrl`,
+`mobileMqttsUrl`, `mobileMediaMqttUrl`, `mqttPort`, `mqttsPort`,
+`mqttQuicUrl`, `fusionUrl`, and API/media URLs. Values are deliberately omitted.
+
+### Persisted Thing user state
+
+The 1,120-byte `kDefaultThingUserV4` blob is no longer opaque. The storage key
+comes from a 32-byte executable constant decoded by the native one-byte XOR
+string helper. Decryption is:
+
+```text
+AES-256 CBC
+zero 16-byte IV
+PKCS#7 padding
+UTF-8 JSON plaintext
+```
+
+The resulting keys match the UID-login user model, including `sid`, `ecode`,
+`uid`, `username`, domain, extras, and profile fields. This independently
+confirms the login response interpretation. The decrypted object was inspected
+in memory only; the preserved encrypted blob remains sufficient to reproduce
+the check.
+
+### Immediate continuation point
+
+The next unresolved protocol step is no longer request crypto. It is:
+
+1. Reproduce the UID password transform. The token-create result supplies RSA
+   material plus a token; the UID-login request sends an encrypted `passwd`
+   with `ifencrypt`.
+2. Trace SDK 5.7.10 MQTT connect parameters after the successful user reset:
+   client ID, username/password derivation, TLS settings, clean-session/keepalive
+   values, and subscriptions.
+3. Only then add `nooie_tui/thing.py`, integrate it before video signalling,
+   create sanitized deterministic tests, and perform the official-app-quit
+   end-to-end test.
+
+No source implementation was made during this forensic checkpoint.
+
+## 2026-07-26 — independent Thing login/MQTT implementation checkpoint
+
+The previously unresolved protocol work has now been implemented far enough
+to reach the Thing UID-login password check against the live service.
+
+### Recovered iOS SDK behavior
+
+Static analysis of the bundled Thing SDK 5.7.10 recovered the remaining MQTT
+configuration without relying on the official app at runtime:
+
+- TLS broker host and port come from the UID-login response's
+  `mobileMqttsUrl` and `mqttsPort`;
+- MQTT uses protocol 3.1.1, a 60-second keepalive, and a clean session;
+- the legacy iOS client ID, username, and password derivations have been
+  reproduced exactly, including the SDK's nested-MD5 slices;
+- the account subscription is `<partnerIdentity>/mb/<thingUid>`;
+- the device inbound topic is `smart/mb/in/<deviceId>`.
+
+The UID-login password field is RSA PKCS#1 v1.5 encryption of the lowercase
+ASCII MD5 digest expected by the Thing SDK, encoded as lowercase hexadecimal
+ciphertext.
+
+### Source implementation
+
+Added `nooie_tui/thing.py` with:
+
+- exact 26-field Thing request construction and HMAC signing;
+- AES-128-ECB request/response encryption;
+- token creation and UID/password login;
+- persistent, app-independent Thing device identity stored outside the
+  repository with private permissions;
+- the recovered iOS MQTT credential derivation;
+- TLS MQTT connection and account/device subscriptions.
+
+Integrated this bootstrap into `nooie_tui/client.py` so Nooie discovery is
+followed by Thing login and MQTT presence before WebRTC signalling. Added
+`aiomqtt` and `cryptography` as locked runtime dependencies.
+
+App credentials remain outside the repository. No private key material,
+account password, session token, or derived MQTT credential has been written
+to this file or source control.
+
+### Verification status
+
+- dependency resolution and environment synchronization succeeded;
+- the new modules compile;
+- Nooie account login and camera discovery still succeed;
+- a live Thing token-create request authenticates and decrypts successfully,
+  proving the app identity, request signature, transport encryption, and
+  request profile;
+- the first live UID-login attempt reached the service but returned
+  `USER_PASSWD_WRONG`.
+
+That last result isolates the remaining issue to the bridge between Nooie's
+already-MD5 password representation and Thing's own password hashing step.
+The evidence indicates that the Nooie bridge supplies its MD5 digest to the
+Thing SDK, producing a double-MD5 value before RSA encryption. This has not yet
+been committed as the final behavior or retried against the live account.
+
+### Immediate continuation point
+
+1. Validate the double-MD5 bridge with one staged live UID-login attempt.
+2. If accepted, lock that behavior into sanitized deterministic unit tests.
+3. Establish TLS MQTT CONNACK and verify the required subscriptions.
+4. Quit the official Nooie app and run the complete independent camera path,
+   confirming WebRTC `Ret=0` and a playable recording.
+5. Run the full test suite, configuration checks, and a secret-leak scan, then
+   append the final result here.
+
+## 2026-07-26 — web research: are we on the wrong a/v transport?
+
+Research-only checkpoint (no code changed). The question was whether `Ret=8`
+persists because the a/v is meant to arrive over a completely different path
+than the Nooie signalling WebSocket we currently offer on. The short answer is
+that this is the most likely single cause, and there is a documented, working
+open-source recipe for the correct path.
+
+### Headline finding: tuya ipc webrtc is signalled over the tuya mqtt link, not a websocket
+
+Every working third-party implementation of a tuya-platform ip camera exchanges
+the webrtc offer/answer/candidates as json messages published over the tuya
+mqtt connection, not over an oem's own websocket. Our client already opens the
+correct tuya mqtt session (`thing.py`), but uses it only as passive presence:
+`mqtt_presence()` subscribes to `<partnerIdentity>/mb/<uid>` and
+`smart/mb/in/<deviceId>` and then just yields. Meanwhile the offer still goes
+out over `wss.eu.nooie.com/ws` as `service.SdpOffer` (`client.py` ~line 970).
+So the media negotiation is happening on a different plane from the one the
+camera answers on. That mismatch is consistent with a parsed-but-declined
+`Ret=8`.
+
+The tuya mqtt signalling envelope (from go2rtc's tuya source, reverse
+engineered and working today):
+
+```jsonc
+{
+  "protocol": 302,          // 302 = webrtc signalling, 312 = control
+  "pv": "2.2",
+  "t": 1710000000,          // unix seconds
+  "data": {
+    "header": { "type": "offer",   // offer|answer|candidate|disconnect
+                "from": "<uid>",
+                "to": "<deviceId>",
+                "sessionid": "<6-char session filter>",
+                "moto_id": "<from webrtc-configs>" },
+    "msg": { /* sdp / candidate / datachannel_enable ... */ }
+  }
+}
+```
+
+Notes that matter for us:
+
+- the offer is **published to the device** over mqtt and the **answer arrives
+  on the caller's own mobile topic** — i.e. the topics we already subscribe to
+  are the signalling channel, not just a presence beacon.
+- the caller strips all `a=extmap` lines from the sdp before sending (tuya
+  devices enforce an ~8 kb json payload limit).
+- h264 rides normal webrtc rtp tracks; h265/hevc streams come over a webrtc
+  **datachannel** named `fmp4Stream` after a small handshake
+  (`{"type":"codec"}` → `{"type":"start","msg":"frame"}` → camera returns
+  ssrcs → `{"type":"complete"}`). tuya cameras answer sdp as h264 even when the
+  stream is hevc, so codec type is taken from the `skill` json, not the answer.
+- ice servers, `moto_id`, `localKey`, and the `skill` capability json come from
+  a **webrtc-configs** fetch, not from the videocall session. our current
+  `/webrtcsession/user/videocall` call returns stun/turn but no `moto_id`;
+  the absence of `moto_id` in our flow is a second sign we are on a legacy /
+  different signalling plane than the camera expects.
+
+### working reference implementations (this is a solved problem elsewhere)
+
+- **go2rtc** tuya module — full, current, byte-level description of the flow:
+  - https://deepwiki.com/AlexxIT/go2rtc/3.7.2-tuya-cameras
+  - https://deepwiki.com/skrashevich/go2rtc/4.6.2-tuya-devices
+  it supports both the **consumer app** login (`*.ismartlife.me`, email +
+  md5→rsa password, `POST /api/login/token`, `POST /api/private/email/login`,
+  `POST /api/jarvis/config`, `POST /api/jarvis/mqtt`) and the **tuya iot cloud**
+  login (`GET /v1.0/token`, `GET /v1.0/users/{uid}/devices/{deviceId}/webrtc-configs`,
+  `POST /v2.0/open-iot-hub/access/config`).
+- **seydx/tuya-ipc-terminal** — cli that streams tuya cameras to rtsp by the
+  same reverse-engineered consumer-app apis (regional hosts
+  `protect-eu.ismartlife.me`, etc.): https://github.com/seydx/tuya-ipc-terminal
+- tuya's own references for the message shapes: `tuya/webrtc-demo-go`,
+  `tuya/tuya-rtc-camera-sdk-android`, and the cloud doc
+  https://developer.tuya.com/en/docs/cloud/96c3154b0d?id=Kam7q5rz91dml
+  ("get configs of creating webrtc connection" → `p2p_config`).
+
+### the cheapest possible win: sidestep nooie via the generic tuya app
+
+Because the device is a tuya device (our `thing.py` already logs into
+`a1.tuyaeu.com` and the app opens `m1.tuyaeu.com:8883`), the highest-leverage
+experiment is to **pair the camera into the generic tuya "smart life" /
+ismartlife.me account** and drive it with go2rtc or tuya-ipc-terminal directly,
+bypassing nooie entirely. caveat: oem apps sometimes bind devices to their own
+`appKey`, so the device may or may not appear in the generic tuya app — this is
+a five-minute real-world test that would either hand us a working stream for
+free or rule the route out.
+
+### legacy path worth a cheap probe (probably closed on fw 7.x)
+
+Bitdefender's 2022 disclosure documents an **older** nooie transport: the
+camera connected to mqtt at `eu.nooie.com:1883` (no auth) and accepted a
+`/device/<ID>/cmd` message carrying `{cmd,url}` that told the camera to **push**
+its **rtsps** stream to an arbitrary url. this is a completely different
+"camera-push" model, not webrtc.
+- https://www.bitdefender.com/en-us/blog/labs/vulnerabilities-identified-in-nooie-baby-monitor
+- affected fw then: PC100A 1.3.88, IPC007A-1080P 2.1.94. the old nooie cam app
+  was retired 2022-02-01 and our camera is on the new tuya stack (fw 7.1.71),
+  so this is likely gone — but `eu.nooie.com:1883` and a residual cmd path are
+  trivial to probe and would, if alive, give a plain rtsps pull with no webrtc
+  at all.
+
+### routes that are dead ends (don't spend time here)
+
+- **local rtsp / onvif**: nooie cameras expose none. confirmed across the ha
+  community thread (https://community.home-assistant.io/t/integrate-nooie-cam-360/189977)
+  and ipc reverse-engineering forums.
+- **firmware mod (thingino / openipc)**: the sensor/soc (ingenic-class) has no
+  device support for these nooie/apeman/osaio models; the sibling vicohome
+  effort hit the identical wall (soc unsupported, all local ports closed) and
+  ended up **cloud-only**
+  (https://community.home-assistant.io/t/help-with-reverse-engineering-webrtc-with-vicohome-camera/653221).
+
+### on `Ret=8` specifically
+
+no authoritative public decode of the nooie/tuya `Ret`/`ret=8` code was found.
+but it fits the pattern above: the camera parses our offer (it addresses the
+`SdpAnswer` back to our `call_id`/`SessionId`) yet declines it, exactly what you
+would expect from an offer arriving on a legacy/oem signalling plane without the
+`moto_id` + mqtt-302 exchange (and, for hevc, the `fmp4Stream` datachannel
+handshake) the current firmware negotiates against.
+
+### ranked recommendation
+
+1. **move signalling onto tuya mqtt (protocol 302).** we are already ~90%
+   connected to the right transport; fetch a webrtc-configs equivalent for
+   `moto_id`/ice, then publish the offer as a 302 message and read the answer
+   off the topics we already subscribe to, instead of `service.SdpOffer` over
+   the nooie websocket. port the message shapes from go2rtc's tuya module.
+2. **sidestep test:** try adding the camera to the generic tuya smart life /
+   ismartlife.me app and stream it with go2rtc/tuya-ipc-terminal. if it binds,
+   the problem is solved without any of the bespoke crypto in `thing.py`.
+3. **cheap legacy probe:** poke `eu.nooie.com:1883` for a surviving `cmd/url`
+   rtsps-push path.
+4. abandon local rtsp/onvif/firmware — none exist for this hardware.
