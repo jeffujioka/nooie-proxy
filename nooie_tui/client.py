@@ -12,12 +12,14 @@ import os
 import re
 import secrets
 import shlex
+import sys
 import time
 import uuid
 import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from signal import SIGINT
 from typing import Any, Iterator, cast
 from urllib.parse import urlsplit
 
@@ -1271,8 +1273,29 @@ def remote_candidate(data: dict[str, Any]) -> RTCIceCandidate | None:
     return candidate
 
 
+# container muxers for the non-file sinks vlc can open. anything with a
+# scheme goes out as mpeg-ts, which vlc plays back live; "-" means stdout.
+STREAM_MUXERS = {
+    "pipe": "mpegts",
+    "udp": "mpegts",
+    "tcp": "mpegts",
+    "srt": "mpegts",
+    "http": "mpegts",
+    "https": "mpegts",
+    "rtp": "rtp",
+    "rtsp": "rtsp",
+}
+
+
+def recorder_target(output: str) -> tuple[str, str | None]:
+    """resolve --output into a pyav target and container format."""
+    target = "pipe:1" if output == "-" else output
+    head = target.split("://", 1)[0] if "://" in target else target
+    return target, STREAM_MUXERS.get(head.split(":", 1)[0])
+
+
 async def receive(
-    config: Config, output: Path, duration: float
+    config: Config, output: str, duration: float
 ) -> None:
     enable_rsa_dtls()
     enable_nooie_ice_credentials()
@@ -1310,9 +1333,16 @@ async def receive(
                     bundlePolicy=RTCBundlePolicy.MAX_BUNDLE,
                 )
             )
-            recorder = MediaRecorder(str(output))
+            target, muxer = recorder_target(output)
+            recorder = MediaRecorder(target, format=muxer)
             recorder_start: asyncio.Task[None] | None = None
             connected = asyncio.Event()
+            # ctrl-c has to unwind the loop rather than kill it, or the
+            # container never gets flushed and closed.
+            interrupted = asyncio.Event()
+            asyncio.get_running_loop().add_signal_handler(
+                SIGINT, interrupted.set
+            )
 
             async def start_recorder() -> None:
                 await asyncio.sleep(0.5)
@@ -1436,13 +1466,24 @@ async def receive(
                 await activate_video(peer)
                 print("video receiver activated", flush=True)
                 print(
-                    f"recording {duration:g} seconds to {output}", flush=True
+                    f"{'streaming' if muxer else 'recording'} "
+                    + (
+                        f"{duration:g} seconds"
+                        if duration > 0
+                        else "until interrupted"
+                    )
+                    + f" to {target}",
+                    flush=True,
                 )
                 recording_deadline = time.monotonic() + duration
-                while time.monotonic() < recording_deadline:
+                while not interrupted.is_set() and (
+                    duration <= 0 or time.monotonic() < recording_deadline
+                ):
                     remaining = recording_deadline - time.monotonic()
                     try:
-                        async with asyncio.timeout(min(1, remaining)):
+                        async with asyncio.timeout(
+                            min(1, remaining) if duration > 0 else 1.0
+                        ):
                             status_message = await websocket.receive()
                     except TimeoutError:
                         continue
@@ -1494,7 +1535,7 @@ async def receive(
                 await peer.close()
 
 
-async def run(output: Path, duration: float) -> None:
+async def run(output: str, duration: float) -> None:
     config = await login_config()
     thing_app = thing_app_from_environment()
     thing_device_id = load_or_create_device_id()
@@ -1559,10 +1600,19 @@ def parse_args() -> argparse.Namespace:
         help="Nooie account username/email (password is prompted)",
     )
     parser.add_argument(
-        "--output", type=Path, default=Path("nooie.mp4"), help="recording path"
+        "--output",
+        default="nooie.mp4",
+        help=(
+            "recording path, or a live mpeg-ts sink vlc can open: "
+            "udp://127.0.0.1:5004, tcp://127.0.0.1:5004?listen, "
+            "or - for stdout"
+        ),
     )
     parser.add_argument(
-        "--duration", type=float, default=30, help="seconds to record"
+        "--duration",
+        type=float,
+        default=30,
+        help="seconds to record; 0 runs until ctrl-c",
     )
     parser.add_argument(
         "--check-config",
@@ -1588,8 +1638,12 @@ def main() -> None:
             normalize_device_id(configured_thing_id)
         print("configuration is complete")
         return
-    if args.output.exists():
-        raise SystemExit(f"refusing to overwrite {args.output}")
+    target, muxer = recorder_target(args.output)
+    if muxer is None and Path(target).exists():
+        raise SystemExit(f"refusing to overwrite {target}")
+    if target.startswith("pipe:1"):
+        # the muxer owns fd 1; keep our chatter off it.
+        sys.stdout = sys.stderr
     asyncio.run(run(args.output, args.duration))
 
 
