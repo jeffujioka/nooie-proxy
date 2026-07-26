@@ -733,42 +733,74 @@ So the media negotiation is happening on a different plane from the one the
 camera answers on. That mismatch is consistent with a parsed-but-declined
 `Ret=8`.
 
-The tuya mqtt signalling envelope (from go2rtc's tuya source, reverse
-engineered and working today):
+There are two topic dialects. nooie's app is a thing-sdk 5.7.10 session, so it
+uses the **mobile-sdk dialect** (not the web/open-api `/av/moto/...` dialect
+that go2rtc/tuya-ipc-terminal use):
 
-```jsonc
-{
-  "protocol": 302,          // 302 = webrtc signalling, 312 = control
-  "pv": "2.2",
-  "t": 1710000000,          // unix seconds
-  "data": {
-    "header": { "type": "offer",   // offer|answer|candidate|disconnect
-                "from": "<uid>",
-                "to": "<deviceId>",
-                "sessionid": "<6-char session filter>",
-                "moto_id": "<from webrtc-configs>" },
-    "msg": { /* sdp / candidate / datachannel_enable ... */ }
-  }
-}
+```text
+publish   smart/mb/out/<devId>          # offer / candidates go here
+subscribe smart/mb/in/<devId>           # answer / candidates arrive here
+broker    ssl://<login.domain.mobileMqttsUrl>:8883   # our m1.tuyaeu.com:8883
 ```
 
-Notes that matter for us:
+we already subscribe to `smart/mb/in/<devId>` for presence — that is the
+**answer** channel. we never **publish** the offer to `smart/mb/out/<devId>`;
+today the offer leaves over the nooie websocket instead. that is the core bug.
 
-- the offer is **published to the device** over mqtt and the **answer arrives
-  on the caller's own mobile topic** — i.e. the topics we already subscribe to
-  are the signalling channel, not just a presence beacon.
-- the caller strips all `a=extmap` lines from the sdp before sending (tuya
-  devices enforce an ~8 kb json payload limit).
-- h264 rides normal webrtc rtp tracks; h265/hevc streams come over a webrtc
-  **datachannel** named `fmp4Stream` after a small handshake
+the 302 outer frame is aes-wrapped with `localKey` (16 ascii bytes, aes-128-ecb
+/ pkcs5, no iv):
+
+```jsonc
+{ "protocol": "302", "pv": "2.2", "t": <unix>, "gwId": "<devId>",
+  "data": base64(aes_ecb(localKey, innerJson)) }
+```
+
+inner envelope `{header, msg}`:
+
+```jsonc
+header: { type:"offer"|"answer"|"candidate"|"disconnect",
+          from, to, sessionid, moto_id, trace_id, transaction_id,
+          seq, rtx, is_pre, p2p_skill, path:"mqtt"|"lan", sub_dev_id }
+offer msg:  { mode:"webrtc", sdp, stream_type, auth, token:[iceServers],
+              datachannel_enable, replay:{is_replay:0} }
+answer msg: { mode:"webrtc", sdp }
+cand msg:   { mode:"webrtc", candidate:"a=candidate:...\r\n" }  // "" = end
+```
+
+protocol **312** carries control: `resolution` (`cmdValue` 0=hd/1=sd) and
+`speaker` (audio backchannel).
+
+sdp rules that silently break naive offers (all confirmed across working
+clients):
+
+- **`auth` is a mandatory admission token in the offer msg** — without it the
+  device rejects. it comes from the rtc-config call below, not from us.
+- **strip every `a=extmap:` line** — device caps the json payload at ~8 kb.
+- **put the audio m-line first**, or tuya returns corrupt sdp.
+- h264 rides normal rtp tracks; h265/hevc rides a webrtc **datachannel**
+  `fmp4Stream` (MaxRetransmits 5, ordered) after a handshake
   (`{"type":"codec"}` → `{"type":"start","msg":"frame"}` → camera returns
-  ssrcs → `{"type":"complete"}`). tuya cameras answer sdp as h264 even when the
-  stream is hevc, so codec type is taken from the `skill` json, not the answer.
-- ice servers, `moto_id`, `localKey`, and the `skill` capability json come from
-  a **webrtc-configs** fetch, not from the videocall session. our current
-  `/webrtcsession/user/videocall` call returns stun/turn but no `moto_id`;
-  the absence of `moto_id` in our flow is a second sign we are on a legacy /
-  different signalling plane than the camera expects.
+  ssrcs → `{"type":"complete"}`). cameras answer h264 in the sdp even for hevc,
+  so codec comes from `skill`, not the answer.
+
+### the single decisive call: `tuya.m.rtc.session.init`
+
+one signed thing request on the api we already talk to
+(`a1.tuyaeu.com/api.json`) settles everything:
+
+```text
+a=tuya.m.rtc.session.init  v=1.0  postData={"devId":"<devId>"}
+```
+
+(it replaces the deprecated `tuya.m.ipc.config.get` v2.0.) the response hands
+us **every** webrtc credential we currently lack: `p2pType` (2=cs2/ppcs,
+4=thing-webrtc), `p2pId`, `password`, `localKey`, `motoId`, `auth`,
+`p2pConfig.ices[]`, and `skill`. it tells us which transport the ipc007 really
+speaks, and it has a documented **side-effect**: *"tuya cloud will send an offer
+to device, speed up the connection process."* that priming is a concrete,
+testable explanation for `Ret=8` — a camera the cloud has primed with its own
+offer may refuse an unprimed third-party one. this is the first thing to try
+with the thing session `thing.py` already builds.
 
 ### working reference implementations (this is a solved problem elsewhere)
 
@@ -841,19 +873,35 @@ its **rtsps** stream to an arbitrary url. this is a completely different
   ended up **cloud-only**
   (https://community.home-assistant.io/t/help-with-reverse-engineering-webrtc-with-vicohome-camera/653221).
 
-### on `Ret=8` specifically
+### on `Ret=8` specifically — it is nooie's own code, not tuya's
 
-no authoritative public decode of the nooie/tuya `Ret`/`ret=8` code was found.
-but it fits the pattern above: the camera parses our offer (it addresses the
-`SdpAnswer` back to our `call_id`/`SessionId`) yet declines it, exactly what you
-would expect from an offer arriving on a legacy/oem signalling plane without the
-`moto_id` + mqtt-302 exchange (and, for hevc, the `fmp4Stream` datachannel
-handshake) the current firmware negotiates against. because nooie runs tuya's
-stock ipc webrtc stack, `ret:8` almost certainly maps to a **documented tuya
-signalling reject** (bad session/moto id, auth/sign failure, or unsupported
-stream type). grep the tuya reference repos for the `ret` code table:
-`tuya/tuya-rtc-camera-sdk-android`, `tuya/tuya-webrtc-ios-demo`,
-`seydx/tuya-ipc-terminal`, and https://developer.tuya.com/en/docs/iot/webrtc .
+correction to the earlier guess: a search of tuya's docs and every rev-eng
+project found **`Ret` is not a field in any tuya 302 schema at all** — tuya
+answers are `{mode, sdp}` only. so `Ret=8` originates in osaio/nooie's **own**
+protobuf signalling layer (the twofish-over-tcp rpc keyed
+`md5(method + transId + "ApEMaNSNoOiE")` that `apeman.py` already implements),
+not in the tuya stack. its meaning has to be pulled from a binary — the
+`SdpAnswer` enum in the ios app or the camera's `anyka_ipc` binary — not from
+the web. this reframes `Ret=8` as a nooie-websocket-plane artefact, which is
+further reason to abandon that plane for the tuya-mqtt-302 path above. (context:
+https://www.trevorkems.com/operation-big-brother-iot-camera/ )
+
+### legacy plain-tcp a/v on port 16116 (almost free to check)
+
+nooie/victure/apeman (same vendor) historically stream a/v over **unencrypted
+tcp on port 16116** — a 16-byte header then raw h264/h265/alaw. there is a
+ready wireshark dissector (`victure.lua`) at
+https://github.com/TKems/Victure-Camera-Vulnerabilities :
+
+```text
+u32 messageSize | u8 syncOne | u8 syncTwo | u8 mediaType | u8 eckByte
+u16 seqNum | u16 dataLength | u32 timestamp | raw h264/h265/alaw
+mediaType: 5=H265, 2=ALAW
+```
+
+an `nmap -p 16116` against the camera and, if open, the dissector on a capture,
+is a near-zero-cost check for a raw local stream that bypasses all the cloud
+crypto.
 
 ### do this first: read the existing pcap
 
@@ -867,18 +915,36 @@ have these captures; this is the cheapest, most decisive next action.
 
 ### ranked recommendation
 
-1. **read the pcap to pick the path** (above) — decisive and free.
-2. **move signalling onto tuya mqtt (protocol 302).** we are already ~90%
-   connected to the right transport; fetch a webrtc-configs equivalent for
-   `moto_id`/ice, then publish the offer as a 302 message and read the answer
-   off the topics we already subscribe to, instead of `service.SdpOffer` over
-   the nooie websocket. port the message shapes and the `ret` code table from
-   go2rtc's / tuya's reference implementations.
-3. **cheap legacy probe:** if the pcap shows a surviving push path, stand up an
-   rtsp/rtsps listener (mediamtx/ffmpeg) and publish the `cmd`+`url` to
-   `eu.nooie.com` mqtt so the camera streams to us — no webrtc at all.
-4. **ruled out — pairing into smart life / official tuya cloud.** oem pid-lock;
+1. **call `tuya.m.rtc.session.init` with the thing session `thing.py` already
+   builds** — one signed request that both reveals `p2pType` (which transport
+   the ipc007 actually speaks) and returns `localKey`/`motoId`/`auth`/`ices` —
+   the credentials we currently lack — and primes the camera. decisive, cheap,
+   uses machinery we already have.
+2. **read `nooie-official-login-live.pcap`** for the app's *successful* live
+   view: does an sdp offer ever cross the nooie websocket in cleartext? if not,
+   a/v is negotiated inside tls:8883 and the websocket/`service.SdpOffer` plane
+   (and its `Ret=8`) is a dead end regardless.
+3. **if `p2pType=4`: move signalling onto tuya mqtt-302.** publish the offer to
+   `smart/mb/out/<devId>` (aes-ecb framed with `localKey`, `auth` token
+   included, extmap stripped, audio m-line first) and read the answer off
+   `smart/mb/in/<devId>` — the topic we already subscribe to — instead of
+   `service.SdpOffer`. mirror tuya-ipc-terminal's envelope and go2rtc's sdp
+   rules; `eisbaw/babymonitor-client` has the mobile-dialect specifics.
+4. **near-free local checks in parallel:** `nmap -p 16116` (legacy raw-tcp a/v,
+   victure dissector) and probe `eu.nooie.com:1883` for a surviving `cmd/url`
+   rtsps-push path.
+5. **ruled out — pairing into smart life / official tuya cloud.** oem pid-lock;
    go2rtc/tuya-ipc-terminal need a genuine tuya account. confirm with a 10-min
    smart-life pairing attempt, then drop.
-5. abandon local rtsp/onvif/firmware — none exist for this hardware (sibling
+6. abandon local rtsp/onvif/firmware — none exist for this hardware (sibling
    gncc is anyka ak3918, outside thingino/openipc's ingenic-only support).
+
+### key reference repos
+
+- `seydx/tuya-ipc-terminal` — `pkg/tuya/mqttCamera.go`, `pkg/tuya/api.go`.
+- `AlexxIT/go2rtc` — `pkg/tuya/{client,smart_api,cloud_api,mqtt}.go`.
+- `eisbaw/babymonitor-client` — deepest public tuya-ipc rev-eng, mobile dialect
+  (`re/mqtt_signaling.md`, `re/webrtc_session.md`); also the mqtt CONNECT
+  credential derivation, which cross-checks our `derive_mqtt_credentials`.
+- `azerty9971/xtend_tuya` — python webrtc reference manager.
+- `TKems/Victure-Camera-Vulnerabilities` — port-16116 dissector.
