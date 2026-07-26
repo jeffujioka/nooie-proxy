@@ -16,6 +16,7 @@ import sys
 import time
 import uuid
 import zlib
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -116,6 +117,20 @@ class LocalIceCandidate:
     sdp_mid: str
     sdp_mline_index: int
     ice_ufrag: str
+
+
+def default_env_path() -> Path:
+    """where a dotenv lives once the CLI is installed on PATH."""
+    configured = os.environ.get("NOOIE_ENV_FILE", "")
+    if configured:
+        return Path(configured).expanduser()
+    if sys.platform == "darwin":
+        root = Path.home() / "Library" / "Application Support"
+    else:
+        root = Path(
+            os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+        )
+    return root / "nooie-tui" / ".env"
 
 
 def load_dotenv(path: Path = Path(".env")) -> None:
@@ -1531,7 +1546,10 @@ async def receive(
                         pass
                 if recorder_start is not None:
                     await recorder_start
-                await recorder.stop()
+                # a player that quit first leaves nothing to flush into, and
+                # the peer still has to be closed.
+                with suppress(OSError):
+                    await recorder.stop()
                 await peer.close()
 
 
@@ -1624,7 +1642,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    # a dotenv beside the working directory wins; the installed CLI then
+    # falls back to the per-user one, since it runs from anywhere.
     load_dotenv()
+    load_dotenv(default_env_path())
     if args.username:
         os.environ["NOOIE_USERNAME"] = args.username
         if not os.environ.get("NOOIE_PASSWORD"):
