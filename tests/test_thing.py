@@ -10,20 +10,17 @@ from unittest.mock import patch
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from nooie_tui.thing import (
+from nooie_proxy.env import identity, state_dir
+from nooie_proxy.thing import (
     ThingApp,
-    ThingClient,
-    ThingRequestProfile,
     ThingSession,
     build_request_params,
     decrypt_result,
     derive_mqtt_credentials,
     encrypt_post_data,
-    load_or_create_device_id,
-    mqtt_topics,
+    mqtt_topic,
     rsa_encrypt_password,
     sign_request,
-    thing_app_from_environment,
 )
 
 APP = ThingApp(
@@ -33,29 +30,18 @@ APP = ThingApp(
 )
 DEVICE_ID = "12345678-1234-4ABC-8DEF-1234567890AB"
 REQUEST_ID = "ABCDEF12-3456-4ABC-8DEF-1234567890AB"
-PROFILE = ThingRequestProfile(
-    platform_name="test-platform",
-    os_system="test-os",
-    language="en",
-    time_zone_id="Europe/London",
-)
 SESSION = ThingSession(
     sid="test-session",
     ecode="test-ecode",
     uid="test-user",
-    username="test-name",
     partner_identity="test-partner",
-    domain={
-        "mobileMqttsUrl": "ssl://mqtt.example.test",
-        "mqttsPort": 8883,
-    },
+    domain={"mobileMqttsUrl": "ssl://mqtt.example.test", "mqttsPort": 8883},
 )
 
 
 class ThingProtocolTests(unittest.TestCase):
-    def test_shared_thing_material_has_built_in_defaults(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
-            app = thing_app_from_environment()
+    def test_bundled_material_has_built_in_defaults(self) -> None:
+        app = ThingApp()
 
         self.assertTrue(app.app_key)
         self.assertTrue(app.app_secret)
@@ -68,20 +54,16 @@ class ThingProtocolTests(unittest.TestCase):
             "result": {"sid": "session", "items": [1, 2, 3]},
         }
 
-        encrypted = encrypt_post_data(
-            APP, REQUEST_ID, wrapper, SESSION.ecode
-        )
+        encrypted = encrypt_post_data(APP, REQUEST_ID, wrapper, SESSION.ecode)
 
         self.assertEqual(
-            decrypt_result(APP, REQUEST_ID, encrypted, SESSION.ecode),
-            wrapper,
+            decrypt_result(APP, REQUEST_ID, encrypted, SESSION.ecode), wrapper
         )
 
     def test_request_without_payload_omits_post_data(self) -> None:
         params = build_request_params(
             APP,
             DEVICE_ID,
-            PROFILE,
             "m.life.home.space.list",
             "1.0",
             None,
@@ -91,6 +73,7 @@ class ThingProtocolTests(unittest.TestCase):
         )
 
         self.assertNotIn("postData", params)
+        self.assertEqual(params["deviceId"], DEVICE_ID)
         signature = params.pop("sign")
         self.assertEqual(signature, sign_request(APP, params))
 
@@ -110,111 +93,39 @@ class ThingProtocolTests(unittest.TestCase):
 
         numbers = private_key.private_numbers()
         plaintext = pow(
-            int(encrypted_hex, 16),
-            numbers.d,
-            numbers.public_numbers.n,
+            int(encrypted_hex, 16), numbers.d, numbers.public_numbers.n
         ).to_bytes(private_key.key_size // 8, "big")
-        digest = hashlib.md5(
-            b"correct horse battery staple"
-        ).hexdigest().encode()
+        digest = (
+            hashlib.md5(b"correct horse battery staple").hexdigest().encode()
+        )
         self.assertEqual(plaintext[-len(digest) :], digest)
         self.assertEqual(plaintext[: -len(digest)], bytes(96))
 
-    def test_mqtt_credentials_and_account_topic(self) -> None:
+    def test_mqtt_credentials_endpoint_and_account_topic(self) -> None:
         credentials = derive_mqtt_credentials(APP, SESSION, DEVICE_ID)
 
         client_hash = hashlib.md5(
             (SESSION.sid + "sdkfasodifca").encode()
         ).hexdigest()
-        self.assertEqual(
-            credentials.client_id,
-            f"iOS_{DEVICE_ID}_{client_hash}",
-        )
-        self.assertEqual(
-            mqtt_topics(SESSION),
-            ["test-partner/mb/test-user"],
-        )
+        self.assertEqual(credentials.client_id, f"iOS_{DEVICE_ID}_{client_hash}")
+        self.assertEqual(mqtt_topic(SESSION), "test-partner/mb/test-user")
+        self.assertEqual(SESSION.mqtt_endpoint, ("mqtt.example.test", 8883))
         self.assertNotIn(credentials.password, repr(credentials))
 
-    def test_persisted_device_identity_is_stable_and_private(self) -> None:
+
+class IdentityTests(unittest.TestCase):
+    def test_persisted_identity_is_stable_and_private(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "state" / "identity.json"
+            root = Path(temporary) / "state"
             with patch.dict(
-                os.environ, {"NOOIE_THING_DEVICE_ID": ""}
-            ):
-                first = load_or_create_device_id(path)
-                second = load_or_create_device_id(path)
+                os.environ, {"XDG_CONFIG_HOME": str(root), "HOME": str(root)}
+            ), patch("sys.platform", "linux"):
+                first, second = identity(), identity()
+                path = state_dir() / "identity"
 
             self.assertEqual(first, second)
+            self.assertEqual(first, first.upper())
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-
-    def test_identity_does_not_restrict_an_existing_parent(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            parent = Path(temporary)
-            parent.chmod(0o755)
-            path = parent / "identity.json"
-
-            with patch.dict(
-                os.environ, {"NOOIE_THING_DEVICE_ID": ""}
-            ):
-                load_or_create_device_id(path)
-
-            self.assertEqual(
-                stat.S_IMODE(parent.stat().st_mode),
-                0o755,
-            )
-
-
-class ThingBootstrapTests(unittest.IsolatedAsyncioTestCase):
-    async def test_home_bootstrap_uses_the_recovered_actions(self) -> None:
-        class RecordingClient(ThingClient):
-            def __init__(self) -> None:
-                super().__init__(APP, DEVICE_ID, PROFILE)
-                self.calls = []
-
-            async def request(
-                self,
-                http,
-                action,
-                version,
-                payload,
-                *,
-                ecode="",
-                sid="",
-            ):
-                self.calls.append(
-                    (action, version, payload, ecode, sid)
-                )
-                if action == "m.life.home.space.list":
-                    return [{"gid": 42}]
-                return []
-
-        client = RecordingClient()
-
-        homes = await client.home_spaces(None, SESSION)
-        devices = await client.home_devices(None, SESSION, 42)
-
-        self.assertEqual(homes, [{"gid": 42}])
-        self.assertEqual(devices, [])
-        self.assertEqual(
-            client.calls,
-            [
-                (
-                    "m.life.home.space.list",
-                    "1.0",
-                    None,
-                    SESSION.ecode,
-                    SESSION.sid,
-                ),
-                (
-                    "m.life.my.group.device.list",
-                    "2.2",
-                    {"gid": 42},
-                    SESSION.ecode,
-                    SESSION.sid,
-                ),
-            ],
-        )
 
 
 if __name__ == "__main__":

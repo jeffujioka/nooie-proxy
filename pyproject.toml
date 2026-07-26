@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "nooie-tui"
-version = "0.1.0"
-description = "An authorised, self-hosted A/V client for your own Nooie IP cameras"
+name = "nooie-proxy"
+version = "0.2.0"
+description = "A live MP4 stream from your own Nooie IP camera"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.scripts]
-nooie-tui = "nooie_tui.client:main"
+nooie-proxy = "nooie_proxy.service:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["nooie_tui"]
+packages = ["nooie_proxy"]

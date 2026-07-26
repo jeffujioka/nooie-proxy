@@ -103,10 +103,10 @@ def build_rpc(method: str, trans_id: int, body: bytes, rpc_type: int = 1) -> byt
     return struct.pack(">I", 4 + len(hdr)) + hdr
 
 
-def parse_rpc(buf: bytes) -> dict:
-    """decode a response ReqHeader -> {tag: int|bytes}. field4=method,
-    field5=transId, field6=code, field11=body (still encrypted; decrypt with
-    sail_key(method, transId))."""
+def parse(buf: bytes) -> dict:
+    """decode a flat protobuf into {tag: int | bytes} (last wins per tag). in a
+    response ReqHeader: field4=method, field5=transId, field6=code, field11=body
+    (still enciphered; decrypt with sail_key(method, transId))."""
     i, out = 0, {}
     while i < len(buf):
         key = buf[i]; i += 1
@@ -153,38 +153,16 @@ def putnatinfo_body(uid: str, nattype: int, lan_ip: str, lan_port: int,
     return _v(1, 2) + _s(3, uid.encode()) + _s(4, b"") + _s(6, sub)
 
 
-def _walk(buf: bytes) -> dict:
-    """decode a flat protobuf into {tag: int | bytes} (last wins per tag)."""
-    i, out = 0, {}
-    while i < len(buf):
-        key = buf[i]; i += 1
-        tag, wt = key >> 3, key & 7
-        if wt == 0:
-            v = s = 0
-            while True:
-                b = buf[i]; i += 1
-                v |= (b & 0x7F) << s; s += 7
-                if not b & 0x80:
-                    break
-            out[tag] = v
-        elif wt == 2:
-            n = buf[i]; i += 1
-            out[tag] = buf[i:i + n]; i += n
-        else:
-            break
-    return out
-
-
 def decode_response(frame: bytes) -> tuple[str, int, dict]:
     """strip the length prefix, parse the ReqHeader, decrypt+walk the body.
     returns (method, trans_id, body-dict)."""
-    hdr = parse_rpc(frame[4:] if len(frame) > 4 else frame)
+    hdr = parse(frame[4:] if len(frame) > 4 else frame)
     method = hdr.get(4, b"")
     method = method.decode() if isinstance(method, bytes) else str(method)
     trans_id = hdr.get(5, 0)
     body = hdr.get(11, b"")
     clear = block_decrypt(body, sail_key(method, trans_id)) if body else b""
-    return method, trans_id, _walk(clear)
+    return method, trans_id, parse(clear)
 
 
 # --- endpoints --------------------------------------------------------------
@@ -193,7 +171,6 @@ def decode_response(frame: bytes) -> tuple[str, int, dict]:
 # servers; natcheck then runs against those (udp :5083/:5084).
 POLICY_HOST = "policy-eu.nooie.com"
 POLICY_PORT = 9000
-NAT_SERVERS = [("3.66.105.77", 5084), ("3.66.105.77", 5083), ("18.184.68.75", 5083)]
 
 
 # --- natcheck registration orchestrator -------------------------------------
@@ -238,7 +215,7 @@ def register(uid: str, timeout: float = 6.0) -> Registration:
     PutNatInfo must return field1 == 0 = success)."""
     # 1. getsrv (tcp 9000) -> first nat server.
     _, _, g = _tcp_rpc(POLICY_HOST, POLICY_PORT, "Getsrv", getsrv_body(uid), timeout)
-    srv = _walk(g[2]) if isinstance(g.get(2), bytes) else {}
+    srv = parse(g[2]) if isinstance(g.get(2), bytes) else {}
     nat = (srv[4].decode(), srv[5])
 
     # 2. NatOne (udp) from a kept-open socket -> our reflexive endpoint + 2nd srv.
@@ -254,7 +231,7 @@ def register(uid: str, timeout: float = 6.0) -> Registration:
         m, _t, b = decode_response(data)
         if m == "NatOne":
             wan_ip = b[1].decode(); wan_port1 = b[2]
-            sub = _walk(b[5]) if isinstance(b.get(5), bytes) else {}
+            sub = parse(b[5]) if isinstance(b.get(5), bytes) else {}
             second = (sub[1].decode(), b.get(4, sub.get(3)))
         if wan_ip and m == "NatCheckData":
             break
@@ -284,42 +261,3 @@ def register(uid: str, timeout: float = 6.0) -> Registration:
     if p.get(1) != 0:
         raise RuntimeError(f"apeman PutNatInfo failed: {p}")
     return Registration(uid, nat, lan_ip, lan_port, wan_ip, wan_port1, nattype, udp)
-
-
-# --- per-device p2p coordinates (from the cloud /device/list response) ------
-
-@dataclass
-class P2PCoords:
-    """the p2p handles nooie's cloud returns for one camera: `secret` (device
-    media key), the relay/heartbeat server (hb_*), and the wan/lan addresses used
-    to reach the device."""
-
-    device_id: str
-    puuid: str
-    secret: str
-    mac: str
-    hb_domain: str
-    hb_server: str
-    hb_port: int
-    wan_ip: str
-    local_ip: str
-
-
-def _ip(value: int, byteorder: str) -> str:
-    return socket.inet_ntoa(struct.pack(byteorder + "I", value))
-
-
-def coords_from_device(dev: dict) -> P2PCoords:
-    """extract p2p coordinates from a /device/list item. the record mixes byte
-    orders: hb_server and wanip are big-endian uint32, local_ip is little-endian."""
-    return P2PCoords(
-        device_id=dev.get("uuid", ""),
-        puuid=str(dev.get("puuid", "")),
-        secret=dev.get("secret", ""),
-        mac=dev.get("mac", ""),
-        hb_domain=dev.get("hb_domain", ""),
-        hb_server=_ip(int(dev.get("hb_server", 0)), ">"),
-        hb_port=int(dev.get("hb_port", 0)),
-        wan_ip=_ip(int(dev.get("wanip", 0)), ">"),
-        local_ip=_ip(int(dev.get("local_ip", 0)), "<"),
-    )
