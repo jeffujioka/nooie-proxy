@@ -3,10 +3,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from nooie_proxy.stream import TICK, Timed, aligned, container
+from nooie_proxy.stream import TICK, Timed, aligned
 
 VIDEO = fractions.Fraction(1, 90000)
-AUDIO = fractions.Fraction(1, 48000)
+AUDIO = fractions.Fraction(1, 16000)
 
 
 class Track:
@@ -22,23 +22,6 @@ class Track:
 
     async def recv(self) -> SimpleNamespace:
         return self.frames.pop(0)
-
-
-class ContainerTests(unittest.TestCase):
-    def test_pipes_and_files_get_fragmented_mp4(self) -> None:
-        for target in ("pipe:1", "/tmp/a.mp4", "clip.mkv"):
-            muxer, options = container(target)
-            self.assertEqual(muxer, "mp4")
-            self.assertIn("movflags", options)
-
-    def test_network_sinks_get_joinable_mpegts(self) -> None:
-        for target in (
-            "udp://127.0.0.1:5004",
-            "tcp://127.0.0.1:5004?listen",
-            "srt://host:9000",
-            "http://host/live",
-        ):
-            self.assertEqual(container(target), ("mpegts", {}))
 
 
 class AlignedTests(unittest.TestCase):
@@ -82,7 +65,7 @@ class TimedTests(unittest.IsolatedAsyncioTestCase):
             [1.0 + index * 0.02 for index in range(4)],
         )
 
-        self.assertEqual(stamps[0], 48000)
+        self.assertEqual(stamps[0], 16000)
         steps = [b - a for a, b in zip(stamps, stamps[1:])]
         self.assertEqual(steps, [960] * 3)
 

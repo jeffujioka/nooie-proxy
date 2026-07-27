@@ -656,13 +656,14 @@ wheels = [
 ]
 
 [[package]]
-name = "nooie-tui"
-version = "0.1.0"
+name = "nooie-proxy"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "aiomqtt" },
     { name = "aiortc" },
+    { name = "av" },
     { name = "cryptography" },
 ]
 
@@ -671,6 +672,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.12,<4" },
     { name = "aiomqtt", specifier = ">=2.5.1,<3" },
     { name = "aiortc", specifier = ">=1.14,<2" },
+    { name = "av", specifier = ">=15,<18" },
     { name = "cryptography", specifier = ">=45,<50" },
 ]
 

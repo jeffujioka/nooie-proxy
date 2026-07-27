@@ -7,9 +7,8 @@ ice password is 24 characters rather than 22.
 
 import fractions
 import os
-import re
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
+from typing import Any
 
 import aioice.ice
 import aiortc.codecs
@@ -23,8 +22,6 @@ from aiortc.rtcrtpparameters import (
     RTCRtpCodecParameters,
     RTCRtpHeaderExtensionParameters,
 )
-from av import CodecContext, InvalidDataError
-from av.frame import Frame
 from av.packet import Packet
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
@@ -51,27 +48,45 @@ AAC = RTCRtpCodecParameters(
 )
 
 
-class AacDecoder(Decoder):
+def opens_a_group(access_unit: bytes) -> bool:
+    """true when the unit carries an idr picture or the parameter sets.
+
+    a consumer joining mid-stream can decode nothing until one arrives, so
+    the muxer is told which packets a group of pictures may start on.
+    """
+    return any(
+        nal and nal[0] & 0x1F in (5, 7)
+        for nal in access_unit.split(b"\x00\x00\x01")
+    )
+
+
+class Verbatim(Decoder):
+    """hand an access unit on as a packet, to be muxed without transcoding.
+
+    aiortc decodes only so that it can re-encode. the camera already sends
+    the h264 and aac a consumer wants, so the work left here is to shed
+    rtp's own framing and date the packet in its clock.
+    """
+
     def __init__(self, codec: RTCRtpCodecParameters) -> None:
-        self.codec = CodecContext.create("aac", "r")
-        config = str(codec.parameters.get("config", "1408"))
-        if re.fullmatch(r"(?:[0-9a-fA-F]{2})+", config):
-            self.codec.extradata = bytes.fromhex(config)
+        self.audio = codec.mimeType.lower().startswith("audio/")
         self.time_base = fractions.Fraction(1, codec.clockRate)
 
-    def decode(self, encoded_frame: JitterFrame) -> list[Frame]:
+    def decode(self, encoded_frame: JitterFrame) -> list[Any]:
         data = encoded_frame.data
-        if len(data) > 4 and data[:2] == b"\x00\x10":
-            data = data[4:]  # rfc 3640 au header
-        packet = Packet(data)
-        packet.pts = encoded_frame.timestamp
+        if self.audio:
+            if len(data) > 4 and data[:2] == b"\x00\x10":
+                data = data[4:]  # rfc 3640 au header
+            if not any(data):
+                # the camera pads its audio with empty access units. they
+                # carry no frame, and a player handed one says so loudly.
+                return []
+        packet = Packet(len(data))
+        packet.update(data)
+        packet.pts = packet.dts = encoded_frame.timestamp
         packet.time_base = self.time_base
-        try:
-            return cast(list[Frame], self.codec.decode(packet))
-        except InvalidDataError:
-            # some cameras intermittently emit an incomplete access unit;
-            # dropping it keeps aiortc's decoder worker alive for the rest.
-            return []
+        packet.is_keyframe = self.audio or opens_a_group(data)
+        return [packet]
 
 
 def _enable_aac() -> None:
@@ -81,12 +96,17 @@ def _enable_aac() -> None:
             AAC,
             *(codec for codec in codecs if codec.payloadType != 96),
         ]
-    original = aiortc.codecs.get_decoder
+
+
+def _pass_media_through() -> None:
+    """mux what the camera sends rather than decode it in order to re-encode.
+
+    the call is negotiated down to one h264 and one aac stream, so every
+    decoder aiortc asks for is one this proxy would rather not run.
+    """
 
     def get_decoder(codec: RTCRtpCodecParameters) -> Decoder:
-        if codec.mimeType.lower() == "audio/aac":
-            return AacDecoder(codec)
-        return original(codec)
+        return Verbatim(codec)
 
     aiortc.codecs.get_decoder = get_decoder
     aiortc.rtcrtpreceiver.get_decoder = get_decoder
@@ -169,6 +189,7 @@ def _enable_nooie_ice_credentials() -> None:
 
 def patch() -> None:
     _enable_aac()
+    _pass_media_through()
     _enable_rsa_dtls()
     _enable_nooie_ice_credentials()
 

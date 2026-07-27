@@ -92,6 +92,6 @@ def country() -> str:
 
 
 def output() -> str:
-    """the mp4 sink: - for stdout, else any url or path pyav can write."""
+    """the sink: - for stdout, else any url or path pyav can write."""
     target = os.environ.get("NOOIE_OUTPUT", "-")
     return "pipe:1" if target == "-" else target

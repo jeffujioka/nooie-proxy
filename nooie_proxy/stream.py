@@ -1,6 +1,7 @@
 """place one webrtc call and mux the camera's a/v to the sink."""
 
 import asyncio
+import fractions
 import json
 import signal
 import time
@@ -8,6 +9,7 @@ from contextlib import suppress
 from typing import Any
 
 import aiohttp
+import av
 from aiortc import (
     MediaStreamTrack,
     RTCBundlePolicy,
@@ -15,31 +17,29 @@ from aiortc import (
     RTCPeerConnection,
     RTCSessionDescription,
 )
-from aiortc.contrib.media import MediaRecorder
+from aiortc.mediastreams import MediaStreamError
 from aiortc.rtp import RtcpRrPacket
 
 from . import cloud, rtc, sdp, signalling
 from .cloud import Config
 from .env import log
 
-# fragmenting is what makes the mp4 a stream: no trailing index to wait for,
-# so the writer never has to seek back.
-FRAGMENTED = {"movflags": "frag_keyframe+empty_moov+default_base_moof"}
-# a pipe or a file has one reader, present from the first byte, so it can be
-# given the mp4 header once. a network sink is joined whenever the consumer
-# feels like it, and mp4 has no way to catch such a reader up -- mpeg-ts
-# repeats its tables forever, so anyone can tune in at the next keyframe.
-JOINABLE = ("udp", "tcp", "srt", "http", "https")
 ANSWER_TIMEOUT = 30
-# the recorder encodes video at 30fps, so two frames dated inside the same
-# 1/30s tick reach the muxer with one dts between them and end the stream.
+# mpeg-ts for every sink, because it repeats its tables forever and so can
+# be joined at any moment. mp4 would need an initialisation segment that
+# only a reader present from the first byte ever sees.
+MUXER = "mpegts"
+# hand each packet to the sink as it is muxed rather than pooling it in
+# the io buffer, so a datagram leaves as soon as there is one to send.
+MUX = {"flush_packets": "1"}
+# the clocks rtp dates each kind in, which the muxer has to be told.
+BASE = {
+    "video": fractions.Fraction(1, 90000),
+    "audio": fractions.Fraction(1, rtc.AAC.clockRate),
+}
+# packets dated inside one tick reach the muxer a single dts apart, which
+# a player reads as a frame lasting no time at all.
 TICK = {"video": 90000 // 30, "audio": 1}
-
-
-def container(target: str) -> tuple[str, dict[str, str]]:
-    """the muxer that suits how this sink will be read."""
-    scheme = target.partition("://")[0] if "://" in target else ""
-    return ("mpegts", {}) if scheme in JOINABLE else ("mp4", FRAGMENTED)
 
 
 def aligned(target: str) -> str:
@@ -60,10 +60,9 @@ class Timed(MediaStreamTrack):
 
     aiortc hands on the camera's rtp timing untouched: each track begins at
     its own first packet, and this camera's video clock runs some 3.5% fast,
-    so video gains about two minutes on audio every hour. fragmented mp4
-    conceals both faults, since the muxer rebases each track, but mpeg-ts
-    carries timestamps as it is given them -- a player joining an hour-old
-    stream is handed tracks minutes apart and shows nothing.
+    so video gains about two minutes on audio every hour. mpeg-ts carries
+    timestamps as it is given them, and a player joining an hour-old stream
+    is otherwise handed tracks minutes apart and shows nothing.
     """
 
     def __init__(self, track: MediaStreamTrack, origin: float) -> None:
@@ -80,11 +79,72 @@ class Timed(MediaStreamTrack):
         if self.shift is None:
             self.shift = now - frame.pts
         # video is dated by arrival, the one clock here that keeps time.
-        # audio arrives true, and its sample cadence has to stay continuous
-        # for the aac encoder, so it is moved bodily onto the same origin.
+        # audio arrives true, and its sample cadence has to stay unbroken
+        # for a decoder, so it is moved bodily onto the same origin.
         stamp = now if self.kind == "video" else frame.pts + self.shift
-        frame.pts = self.last = max(self.last + TICK[self.kind], stamp)
+        frame.dts = frame.pts = self.last = max(
+            self.last + TICK[self.kind], stamp
+        )
         return frame
+
+
+class Remux:
+    """the container the camera's own packets are written into.
+
+    nothing is decoded and nothing is re-encoded: the access units aiortc
+    has already reassembled are muxed as they arrive. that costs almost no
+    cpu, and spares the picture the seconds an encoder spends looking ahead
+    of it before letting any of it go.
+    """
+
+    def __init__(self, target: str) -> None:
+        self.container = av.open(
+            aligned(target), "w", format=MUXER, options=MUX
+        )
+        self.streams: dict[Any, Any] = {}
+        self.pumps: list[asyncio.Task[None]] = []
+
+    def add(self, track: Any) -> None:
+        """declare a track, which every one must be before the first packet."""
+        self.streams[track] = (
+            self.video() if track.kind == "video" else self.audio()
+        )
+
+    def video(self) -> Any:
+        # a mux stream builds no codec context at all, so the muxer reads
+        # the camera's parameter sets out of the stream where they belong.
+        return self.container.add_mux_stream("h264", time_base=BASE["video"])
+
+    def audio(self) -> Any:
+        # aac has to be declared the long way: the muxer can only frame it
+        # once it has been handed the config the camera announced in sdp.
+        stream = self.container.add_stream("aac")
+        stream.codec_context.sample_rate = rtc.AAC.clockRate
+        stream.codec_context.layout = "mono"
+        stream.codec_context.extradata = bytes.fromhex(
+            str(rtc.AAC.parameters["config"])
+        )
+        stream.time_base = BASE["audio"]
+        return stream
+
+    async def start(self) -> None:
+        self.pumps = [
+            asyncio.create_task(self.pump(track, stream))
+            for track, stream in self.streams.items()
+        ]
+
+    async def pump(self, track: Any, stream: Any) -> None:
+        with suppress(MediaStreamError):
+            while True:
+                packet = await track.recv()
+                packet.stream = stream
+                self.container.mux(packet)
+
+    async def stop(self) -> None:
+        for pump in self.pumps:
+            pump.cancel()
+        await asyncio.gather(*self.pumps, return_exceptions=True)
+        self.container.close()
 
 
 async def stream(config: Config, target: str) -> None:
@@ -123,8 +183,7 @@ async def place_call(
             bundlePolicy=RTCBundlePolicy.MAX_BUNDLE,
         )
     )
-    muxer, options = container(target)
-    sink = MediaRecorder(aligned(target), format=muxer, options=options)
+    sink = Remux(target)
     origin = time.monotonic()
     started: asyncio.Task[None] | None = None
     connected = asyncio.Event()
@@ -142,7 +201,7 @@ async def place_call(
     def on_track(track: Any) -> None:
         nonlocal started
         log(f"receiving {track.kind}")
-        sink.addTrack(Timed(track, origin))
+        sink.add(Timed(track, origin))
         started = started or asyncio.create_task(open_sink())
 
     @peer.on("connectionstatechange")
