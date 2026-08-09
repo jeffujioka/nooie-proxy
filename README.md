@@ -20,7 +20,7 @@ after.
 Python 3.11+ and [uv](https://docs.astral.sh/uv/):
 
 ```sh
-git clone https://github.com/ltrgoddard/nooie-proxy.git
+git clone https://github.com/ltrgoddard/hass-nooie.git
 cd nooie-proxy/proxy
 uv tool install --editable .
 ```

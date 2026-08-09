@@ -3,7 +3,6 @@ import unittest
 from unittest.mock import patch
 
 from aioice import Connection
-
 from nooie_proxy import rtc, sdp, signalling
 from nooie_proxy.cloud import Config, ice_servers, login_body, registration_body
 

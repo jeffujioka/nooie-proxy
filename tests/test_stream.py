@@ -1,4 +1,5 @@
 import fractions
+import itertools
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -66,7 +67,7 @@ class TimedTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(stamps[0], 16000)
-        steps = [b - a for a, b in zip(stamps, stamps[1:])]
+        steps = [b - a for a, b in itertools.pairwise(stamps)]
         self.assertEqual(steps, [960] * 3)
 
     async def test_frames_arriving_within_a_tick_stay_distinct(self) -> None:

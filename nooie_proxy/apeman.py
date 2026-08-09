@@ -109,19 +109,25 @@ def parse(buf: bytes) -> dict:
     (still enciphered; decrypt with sail_key(method, transId))."""
     i, out = 0, {}
     while i < len(buf):
-        key = buf[i]; i += 1
+        key = buf[i]
+        i += 1
         tag, wt = key >> 3, key & 7
         if wt == 0:
-            v = s = 0
+            v = 0
+            s = 0
             while True:
-                b = buf[i]; i += 1
-                v |= (b & 0x7F) << s; s += 7
+                b = buf[i]
+                i += 1
+                v |= (b & 0x7F) << s
+                s += 7
                 if not b & 0x80:
                     break
             out[tag] = v
         elif wt == 2:
-            n = buf[i]; i += 1
-            out[tag] = buf[i:i + n]; i += n
+            n = buf[i]
+            i += 1
+            out[tag] = buf[i : i + n]
+            i += n
         else:
             break
     return out
@@ -226,11 +232,12 @@ def register(uid: str, timeout: float = 6.0) -> Registration:
     for _ in range(6):  # drain NatOne + the server-pushed NatCheckData
         try:
             data, _from = udp.recvfrom(4096)
-        except socket.timeout:
+        except TimeoutError:
             break
         m, _t, b = decode_response(data)
         if m == "NatOne":
-            wan_ip = b[1].decode(); wan_port1 = b[2]
+            wan_ip = b[1].decode()
+            wan_port1 = b[2]
             sub = parse(b[5]) if isinstance(b.get(5), bytes) else {}
             second = (sub[1].decode(), b.get(4, sub.get(3)))
         if wan_ip and m == "NatCheckData":
@@ -246,7 +253,7 @@ def register(uid: str, timeout: float = 6.0) -> Registration:
             data, _from = udp.recvfrom(4096)
             _m, _t, b = decode_response(data)
             wan_port2 = b.get(2, wan_port1)
-        except socket.timeout:
+        except TimeoutError:
             pass
     nattype = 5 if wan_port2 != wan_port1 else 0  # 5 = SYMMETRIC_NAT
 
@@ -254,7 +261,9 @@ def register(uid: str, timeout: float = 6.0) -> Registration:
     lan_ip = udp.getsockname()[0]
     if lan_ip in ("0.0.0.0", ""):
         probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        probe.connect(nat); lan_ip = probe.getsockname()[0]; probe.close()
+        probe.connect(nat)
+        lan_ip = probe.getsockname()[0]
+        probe.close()
     lan_port = udp.getsockname()[1]
     body = putnatinfo_body(uid, nattype, lan_ip, lan_port, wan_ip, wan_port1)
     _, _, p = _tcp_rpc(nat[0], nat[1], "PutNatInfo", body, timeout)

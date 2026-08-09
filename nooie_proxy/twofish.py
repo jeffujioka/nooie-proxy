@@ -8,10 +8,12 @@ keys and round-trips the official ecb known-answer vectors (see __main__).
 def _gfm(a, b, p):  # gf(2^8) multiply mod primitive poly p (0x100 bit implicit)
     r = 0
     while b:
-        if b & 1: r ^= a
+        if b & 1:
+            r ^= a
         b >>= 1
         a <<= 1
-        if a & 0x100: a ^= p
+        if a & 0x100:
+            a ^= p
     return r & 0xff
 
 _Q0 = ((8,1,7,13,6,15,3,2,0,11,5,9,14,12,10,4),
@@ -55,7 +57,8 @@ def _h(x, L, k):
         b = (x >> (8 * c)) & 0xff
         for s in range(4 - k, 5):
             b = _Q[_SEL[c][s]][b]
-            if s < 4: b ^= (L[3 - s] >> (8 * c)) & 0xff
+            if s < 4:
+                b ^= (L[3 - s] >> (8 * c)) & 0xff
         y.append(b)
     z = 0
     for col in range(4):
@@ -67,7 +70,8 @@ def _h(x, L, k):
 
 class Twofish:
     def __init__(self, key):
-        n = len(key); k = n // 8
+        n = len(key)
+        k = n // 8
         w = [int.from_bytes(key[4 * i:4 * i + 4], "little") for i in range(2 * k)]
         Me = [w[2 * i] for i in range(k)]
         Mo = [w[2 * i + 1] for i in range(k)]
@@ -92,44 +96,69 @@ class Twofish:
     def _g(self, x): return _h(x, self.S, self.k)
 
     def encrypt(self, pt):
-        R = [int.from_bytes(pt[4 * i:4 * i + 4], "little") ^ self.K[i] for i in range(4)]
+        R = [
+            int.from_bytes(pt[4 * i : 4 * i + 4], "little") ^ self.K[i]
+            for i in range(4)
+        ]
         for r in range(16):
-            t0 = self._g(R[0]); t1 = self._g(_rol(R[1], 8))
+            t0 = self._g(R[0])
+            t1 = self._g(_rol(R[1], 8))
             f0 = (t0 + t1 + self.K[2 * r + 8]) & 0xffffffff
             f1 = (t0 + 2 * t1 + self.K[2 * r + 9]) & 0xffffffff
             R[2] = _ror(R[2] ^ f0, 1)
             R[3] = _rol(R[3], 1) ^ f1
             R = [R[2], R[3], R[0], R[1]]
         R = [R[2], R[3], R[0], R[1]]
-        return b"".join(((R[i] ^ self.K[i + 4]) & 0xffffffff).to_bytes(4, "little") for i in range(4))
+        return b"".join(
+            ((R[i] ^ self.K[i + 4]) & 0xffffffff).to_bytes(4, "little")
+            for i in range(4)
+        )
 
     def decrypt(self, ct):
-        R = [int.from_bytes(ct[4 * i:4 * i + 4], "little") ^ self.K[i + 4] for i in range(4)]
+        R = [
+            int.from_bytes(ct[4 * i : 4 * i + 4], "little") ^ self.K[i + 4]
+            for i in range(4)
+        ]
         for r in range(15, -1, -1):
-            t0 = self._g(R[0]); t1 = self._g(_rol(R[1], 8))
+            t0 = self._g(R[0])
+            t1 = self._g(_rol(R[1], 8))
             f0 = (t0 + t1 + self.K[2 * r + 8]) & 0xffffffff
             f1 = (t0 + 2 * t1 + self.K[2 * r + 9]) & 0xffffffff
             R[2] = _rol(R[2], 1) ^ f0
             R[3] = _ror(R[3] ^ f1, 1)
             R = [R[2], R[3], R[0], R[1]]
         R = [R[2], R[3], R[0], R[1]]
-        return b"".join(((R[i] ^ self.K[i]) & 0xffffffff).to_bytes(4, "little") for i in range(4))
+        return b"".join(
+            ((R[i] ^ self.K[i]) & 0xffffffff).to_bytes(4, "little")
+            for i in range(4)
+        )
 
 
 if __name__ == "__main__":
     import binascii
     # official ecb_tbl.txt I=1 known-answer vectors (key, pt, ct)
     kats = [
-        ("00000000000000000000000000000000", "00000000000000000000000000000000",
-         "9F589F5CF6122C32B6BFEC2F2AE8C35A"),
-        ("0123456789ABCDEFFEDCBA98765432100011223344556677", "00000000000000000000000000000000",
-         "CFD1D2E5A9BE9CDF501F13B892BD2248"),
-        ("0123456789ABCDEFFEDCBA987654321000112233445566778899AABBCCDDEEFF",
-         "00000000000000000000000000000000", "37527BE0052334B89F0CFCCAE87CFA20"),
+        (
+            "00000000000000000000000000000000",
+            "00000000000000000000000000000000",
+            "9F589F5CF6122C32B6BFEC2F2AE8C35A",
+        ),
+        (
+            "0123456789ABCDEFFEDCBA98765432100011223344556677",
+            "00000000000000000000000000000000",
+            "CFD1D2E5A9BE9CDF501F13B892BD2248",
+        ),
+        (
+            "0123456789ABCDEFFEDCBA987654321000112233445566778899AABBCCDDEEFF",
+            "00000000000000000000000000000000",
+            "37527BE0052334B89F0CFCCAE87CFA20",
+        ),
     ]
     for kh, ph, ch in kats:
         t = Twofish(binascii.unhexlify(kh))
         ct = t.encrypt(binascii.unhexlify(ph))
-        ok = binascii.hexlify(ct).decode().upper() == ch
+        ciphertext = binascii.hexlify(ct).decode().upper()
+        ok = ciphertext == ch
         rt = t.decrypt(ct) == binascii.unhexlify(ph)
-        print(f"k{len(kh)*4}: enc {'ok' if ok else 'FAIL '+binascii.hexlify(ct).decode()} dec {'ok' if rt else 'FAIL'}")
+        status = "ok" if ok else f"FAIL {ciphertext}"
+        print(f"k{len(kh) * 4}: enc {status} dec {'ok' if rt else 'FAIL'}")

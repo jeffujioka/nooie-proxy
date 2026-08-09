@@ -29,8 +29,9 @@ async def list_devices() -> None:
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=30)
     ) as http:
-        devices = await cloud.list_devices(http)
-    print("\t".join(("uuid", "name", "model", "online")))
+        config = await cloud.authenticate(http)
+        devices = await cloud.list_devices(http, config)
+    print("uuid\tname\tmodel\tonline")
     for device in devices:
         print(
             "\t".join(

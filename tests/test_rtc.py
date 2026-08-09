@@ -3,7 +3,6 @@ import unittest
 
 from aiortc.jitterbuffer import JitterFrame
 from aiortc.rtcrtpparameters import RTCRtpCodecParameters
-
 from nooie_proxy.rtc import AAC, Verbatim, opens_a_group
 
 H264 = RTCRtpCodecParameters(

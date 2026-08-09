@@ -129,7 +129,7 @@ async def authenticate(http: aiohttp.ClientSession) -> Config:
         json=login_body(username, password, phone_code),
     )
     if not isinstance(data, dict):
-        raise RuntimeError("login response has no data object")
+        raise TypeError("login response has no data object")
     config = Config(
         api_token=str(data["api_token"]),
         uid=str(data["uid"]),
@@ -149,16 +149,17 @@ async def authenticate(http: aiohttp.ClientSession) -> Config:
 async def login(http: aiohttp.ClientSession) -> Config:
     """sign in, register this install, and settle on one camera."""
     config = await authenticate(http)
-    camera = await select_camera(http, config)
+    camera = await select_camera(await list_devices(http, config))
     log(f"selected camera {camera['type']}")
     return replace(
         config, device_id=str(camera["uuid"]), model_id=str(camera["type"])
     )
 
 
-async def list_devices(http: aiohttp.ClientSession) -> list[dict[str, Any]]:
+async def list_devices(
+    http: aiohttp.ClientSession, config: Config
+) -> list[dict[str, Any]]:
     """every camera on the account, for NOOIE_DEVICE_ID to choose among."""
-    config = await authenticate(http)
     data = await request(
         http,
         "device list",
@@ -174,10 +175,7 @@ async def list_devices(http: aiohttp.ClientSession) -> list[dict[str, Any]]:
     ]
 
 
-async def select_camera(
-    http: aiohttp.ClientSession, config: Config
-) -> dict[str, Any]:
-    devices = await list_devices(http)
+async def select_camera(devices: list[dict[str, Any]]) -> dict[str, Any]:
     wanted = os.environ.get("NOOIE_DEVICE_ID", "")
     cameras = [
         item
@@ -185,7 +183,7 @@ async def select_camera(
         if isinstance(item, dict)
         and item.get("uuid")
         and item.get("type")
-        and wanted in ("", item.get("uuid"))
+        and (not wanted or wanted == item.get("uuid"))
     ]
     online = [item for item in cameras if int(item.get("online", 0)) == 1]
     for group in (online, cameras):

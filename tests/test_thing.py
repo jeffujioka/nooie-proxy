@@ -9,7 +9,6 @@ from unittest.mock import patch
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-
 from nooie_proxy.env import identity, state_dir
 from nooie_proxy.thing import (
     ThingApp,

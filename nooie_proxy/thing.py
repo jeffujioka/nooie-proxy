@@ -14,9 +14,10 @@ import json
 import ssl
 import time
 import uuid
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Mapping
+from typing import Any
 
 import aiohttp
 import aiomqtt

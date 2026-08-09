@@ -1,0 +1,5 @@
+# The codebase prefers explicit, readable constructions over these two
+# stylistic rewrites (a compact space-joined field list, and joining
+# expected multi-line test fixtures line by line).
+[lint]
+ignore = ["FLY002", "SIM905"]
