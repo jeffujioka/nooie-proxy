@@ -1,6 +1,7 @@
 """nooie-proxy: sign in to a nooie camera and put its stream on stdout."""
 
 import asyncio
+import sys
 
 import aiohttp
 
@@ -23,6 +24,30 @@ async def serve() -> None:
             await stream(config, target)
 
 
-def main() -> None:
+async def list_devices() -> None:
+    """print every camera on the account so NOOIE_DEVICE_ID can be chosen."""
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=30)
+    ) as http:
+        devices = await cloud.list_devices(http)
+    print("\t".join(("uuid", "name", "model", "online")))
+    for device in devices:
+        print(
+            "\t".join(
+                (
+                    str(device.get("uuid", "")),
+                    str(device.get("name", "")),
+                    str(device.get("type", "")),
+                    "yes" if int(device.get("online", 0)) == 1 else "no",
+                )
+            )
+        )
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
     load_environment()
-    asyncio.run(serve())
+    if "--list-devices" in argv:
+        asyncio.run(list_devices())
+    else:
+        asyncio.run(serve())

@@ -116,8 +116,8 @@ async def request(
     return payload.get("data")
 
 
-async def login(http: aiohttp.ClientSession) -> Config:
-    """sign in, register this install, and settle on one camera."""
+async def authenticate(http: aiohttp.ClientSession) -> Config:
+    """sign in and register this install, without settling on a camera."""
     username, password = credentials()
     phone_code = identity()
     request_uuid = uuid.uuid4().hex
@@ -143,6 +143,12 @@ async def login(http: aiohttp.ClientSession) -> Config:
         headers(config),
         json=registration_body(config),
     )
+    return config
+
+
+async def login(http: aiohttp.ClientSession) -> Config:
+    """sign in, register this install, and settle on one camera."""
+    config = await authenticate(http)
     camera = await select_camera(http, config)
     log(f"selected camera {camera['type']}")
     return replace(
@@ -150,9 +156,9 @@ async def login(http: aiohttp.ClientSession) -> Config:
     )
 
 
-async def select_camera(
-    http: aiohttp.ClientSession, config: Config
-) -> dict[str, Any]:
+async def list_devices(http: aiohttp.ClientSession) -> list[dict[str, Any]]:
+    """every camera on the account, for NOOIE_DEVICE_ID to choose among."""
+    config = await authenticate(http)
     data = await request(
         http,
         "device list",
@@ -161,7 +167,17 @@ async def select_camera(
         method="GET",
         params={"page": 1, "per_page": 100},
     )
-    devices = data.get("data", []) if isinstance(data, dict) else []
+    return [
+        item
+        for item in (data.get("data", []) if isinstance(data, dict) else [])
+        if isinstance(item, dict)
+    ]
+
+
+async def select_camera(
+    http: aiohttp.ClientSession, config: Config
+) -> dict[str, Any]:
+    devices = await list_devices(http)
     wanted = os.environ.get("NOOIE_DEVICE_ID", "")
     cameras = [
         item
