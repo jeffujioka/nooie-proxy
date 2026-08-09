@@ -13,6 +13,7 @@ from typing import Any
 import aiohttp
 from aiortc import RTCIceServer
 
+from . import cache
 from .env import country, credentials, identity, log
 from .profile import API_BASE, APP_ID, APP_SECRET, DEVICE, USER_AGENT
 
@@ -115,8 +116,25 @@ async def request(
     return payload.get("data")
 
 
-async def authenticate(http: aiohttp.ClientSession) -> Config:
+def stored() -> Config | None:
+    """the session the last run left behind, if it left one."""
+    session = cache.load("nooie")
+    if not all(session.get(field) for field in ("api_token", "uid", "request")):
+        return None
+    return Config(
+        api_token=str(session["api_token"]),
+        uid=str(session["uid"]),
+        phone_code=identity(),
+        request_uuid=str(session["request"]),
+    )
+
+
+async def authenticate(
+    http: aiohttp.ClientSession, *, fresh: bool = False
+) -> Config:
     """sign in and register this install, without settling on a camera."""
+    if not fresh and (config := stored()) is not None:
+        return config
     username, password = credentials()
     phone_code = identity()
     request_uuid = uuid.uuid4().hex
@@ -142,13 +160,39 @@ async def authenticate(http: aiohttp.ClientSession) -> Config:
         headers(config),
         json=registration_body(config),
     )
+    cache.save(
+        "nooie",
+        {
+            "api_token": config.api_token,
+            "uid": config.uid,
+            "request": config.request_uuid,
+        },
+    )
     return config
+
+
+async def signed_in(
+    http: aiohttp.ClientSession,
+) -> tuple[Config, list[dict[str, Any]]]:
+    """a session that answers, and the camera list that proved it."""
+    reusing = stored() is not None
+    try:
+        config = await authenticate(http)
+        return config, await list_devices(http, config)
+    except RuntimeError:
+        if not reusing:
+            raise
+        # a stored session that has gone stale looks exactly like this.
+        log("the stored Nooie session was refused; signing in again")
+        cache.forget("nooie")
+    config = await authenticate(http, fresh=True)
+    return config, await list_devices(http, config)
 
 
 async def login(http: aiohttp.ClientSession) -> Config:
     """sign in, register this install, and settle on one camera."""
-    config = await authenticate(http)
-    camera = await select_camera(await list_devices(http, config))
+    config, devices = await signed_in(http)
+    camera = await select_camera(devices)
     log(f"selected camera {camera['type']}")
     return replace(
         config, device_id=str(camera["uuid"]), model_id=str(camera["type"])

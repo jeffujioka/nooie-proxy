@@ -1,10 +1,11 @@
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from nooie_proxy.env import load_dotenv
+from nooie_proxy.env import identity, load_dotenv, state_dir
 
 # a credential is far likelier to contain punctuation than the file is to want
 # shell semantics, so every one of these must survive verbatim. mangling one
@@ -66,6 +67,21 @@ class DotenvTests(unittest.TestCase):
     def test_a_malformed_line_is_refused(self) -> None:
         with self.assertRaises(SystemExit):
             self.load("NOT A VALID LINE\n")
+
+
+class IdentityTests(unittest.TestCase):
+    def test_persisted_identity_is_stable_and_private(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "state"
+            with patch.dict(
+                os.environ, {"XDG_CONFIG_HOME": str(root), "HOME": str(root)}
+            ), patch("sys.platform", "linux"):
+                first, second = identity(), identity()
+                path = state_dir() / "identity"
+
+            self.assertEqual(first, second)
+            self.assertEqual(first, first.upper())
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
 
 if __name__ == "__main__":

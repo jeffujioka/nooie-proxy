@@ -51,6 +51,19 @@ value in the file.
 of every camera on the account. The proxy also stores a UUID beside the
 dotenv to identify this install. Do not edit or delete it.
 
+## Sessions
+
+The proxy stores its Nooie session in `sessions.json` beside the identity and
+reuses it, so a restart signs in again only when the account refuses what it
+holds. This keeps a camera that retries from becoming a login loop. The file
+holds session secrets, and the proxy writes it with the same permissions as
+the identity. Delete it to sign in from nothing.
+
+Nooie's signalling holds one websocket for each install, and a second
+connection closes the first. Two proxies that share a state directory
+therefore end each other's calls. To run more than one, give each its own
+`XDG_CONFIG_HOME`, or on macOS its own `HOME`.
+
 ## Stream
 
 Every sink carries MPEG-TS with the camera's own H.264 and AAC. As a result, a
@@ -70,18 +83,18 @@ call. Limit the retry rate to avoid too many login attempts.
 
 ## Design
 
-Three independent handshakes precede each call, and each one has a module.
+Two independent handshakes precede each call, and each one has a module.
 
 | module | contents |
 | --- | --- |
 | `cloud` | the Nooie REST API: login, registration, camera selection, session |
-| `thing` | the bundled Tuya account: UID login and MQTT presence |
 | `apeman` | publishes the local NAT mapping on the Nooie P2P network |
 | `sdp` | the compact Nooie SDP and ICE dialect, in both directions |
 | `signalling` | the WebSocket envelopes and the answer matching |
 | `rtc` | the aiortc patches: AAC, passthrough, RSA DTLS at 1200 bytes, ICE sizes |
 | `stream` | places the call and muxes the tracks |
 | `env` | the dotenv, the install identity, and the credentials |
+| `cache` | the stored sessions, so a restart does not sign in again |
 | `profile` | the app build the proxy presents itself as |
 | `service` | the command line entry point |
 | `twofish` | the cipher the apeman RPC uses |

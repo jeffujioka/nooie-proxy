@@ -66,7 +66,7 @@ def canonical_uuid(value: str) -> str:
 
 
 def identity() -> str:
-    """one stable uuid naming this install to both nooie and thing.
+    """one stable uuid naming this install to nooie.
 
     written through a temporary file: a run killed mid-write would otherwise
     leave an empty identity behind, and every later run would then die on it.

@@ -55,6 +55,25 @@ def aligned(target: str) -> str:
     return f"{target}{'&' if '?' in target else '?'}pkt_size={7 * 188}"
 
 
+class Ending:
+    """the end of the call: the wait for it, and the first reason given.
+
+    the first reason is the true one. a track that ends takes the sink and
+    the peer down with it, and each of those has something to say as well.
+    """
+
+    def __init__(self) -> None:
+        self.reached = asyncio.Event()
+        self.why = ""
+
+    def set(self, why: str) -> None:
+        self.why = self.why or why
+        self.reached.set()
+
+    def is_set(self) -> bool:
+        return self.reached.is_set()
+
+
 class Timed(MediaStreamTrack):
     """a track dated by this machine's clock rather than the camera's.
 
@@ -97,7 +116,7 @@ class Remux:
     of it before letting any of it go.
     """
 
-    def __init__(self, target: str, stopped: asyncio.Event) -> None:
+    def __init__(self, target: str, ending: Ending) -> None:
         self.container = av.open(
             aligned(target), "w", format=MUXER, options=MUX
         )
@@ -105,7 +124,7 @@ class Remux:
         self.pumps: list[asyncio.Task[None]] = []
         # set when a track ends or the sink dies, so the call unwinds instead
         # of streaming into nothing until something else kills the process.
-        self.stopped = stopped
+        self.ending = ending
 
     def add(self, track: Any) -> None:
         """declare a track, which every one must be before the first packet."""
@@ -144,14 +163,14 @@ class Remux:
                 packet.stream = stream
                 self.container.mux(packet)
         except MediaStreamError:
-            log(f"{track.kind} track ended")
+            self.ending.set(f"the camera stopped sending {track.kind}")
         except Exception as error:  # noqa: BLE001 — the sink is the boundary
             # the reader hung up (go2rtc restarting, a closed pipe) or the url
             # went away; whatever pyav raises, the call has to end, and without
             # this the failure is swallowed and it spins on writing nowhere.
-            log(f"{track.kind} sink failed: {error}")
+            self.ending.set(f"the {track.kind} sink failed: {error}")
         finally:
-            self.stopped.set()
+            self.ending.set(f"the {track.kind} pump stopped")
 
     async def stop(self) -> None:
         for pump in self.pumps:
@@ -204,14 +223,15 @@ async def place_call(
         )
     )
     connected = asyncio.Event()
-    stopped = asyncio.Event()
-    sink = Remux(target, stopped)
+    ending = Ending()
+    sink = Remux(target, ending)
     origin = time.monotonic()
+    streaming = 0.0
     started: asyncio.Task[None] | None = None
     loop = asyncio.get_running_loop()
     for number in (signal.SIGINT, signal.SIGTERM):
         # unwind rather than die, so the container is flushed and closed.
-        loop.add_signal_handler(number, stopped.set)
+        loop.add_signal_handler(number, ending.set, "this process was stopped")
 
     async def open_sink() -> None:
         await asyncio.sleep(0.5)  # let the second track arrive first
@@ -230,7 +250,7 @@ async def place_call(
         if peer.connectionState == "connected":
             connected.set()
         elif peer.connectionState in ("failed", "closed"):
-            stopped.set()
+            ending.set(f"the peer connection {peer.connectionState}")
 
     async def send(frame: dict[str, Any]) -> None:
         await websocket.send_json(frame, dumps=signalling.dumps)
@@ -293,11 +313,12 @@ async def place_call(
         await send(signalling.switch(config, session, call))
         await receive(websocket, 2)
         await request_keyframe(peer)
+        streaming = time.monotonic()
         log(f"streaming to {target}")
-        while not stopped.is_set():
+        while not ending.is_set():
             message = await receive(websocket, 1)
             if message is False:
-                log("signalling closed")
+                ending.set("Nooie closed the signalling websocket")
                 break
             if message and any(
                 "SwitchResp" in method for method in signalling.methods(message)
@@ -315,6 +336,14 @@ async def place_call(
         with suppress(OSError):
             await sink.stop()
         await peer.close()
+        # the one line worth keeping: how long the call carried, and what
+        # ended it. a call that never streamed raises instead, and that
+        # message is the last word.
+        if streaming:
+            log(
+                f"call ended after {time.monotonic() - streaming:.0f} s of "
+                f"streaming: {ending.why or 'an unknown cause'}"
+            )
 
 
 async def receive(

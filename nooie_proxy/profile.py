@@ -1,12 +1,9 @@
 """the nooie ios build this proxy impersonates: credentials and fingerprint.
 
 everything the account servers see about the caller comes from one app build
-(nooie ios 3.7.0, thing sdk 5.7.10, on an ipad pro 12.9). if nooie ships a
-new app and the backend starts rejecting this one, the strings to update all
-live here.
+(nooie ios 3.7.0, on an ipad pro 12.9). if nooie ships a new app and the
+backend starts rejecting this one, the strings to update all live here.
 """
-
-import json
 
 # --- nooie cloud rest api and websocket signalling -------------------------
 
@@ -28,55 +25,6 @@ DEVICE = {
     "language": "en",
     "phone_model": "iPad8,6",
     "push_type": 3,
-}
-
-# --- the thing/tuya sdk bundle nooie ships inside the app ------------------
-
-THING_API_URL = "https://a1.tuyaeu.com/api.json"
-THING_APP_KEY = "kvradrme9pmyjckdd7ws"
-THING_APP_SECRET = "jmaj939wk95awxur9xe7trgpwnyddpu8"
-THING_PICTURE_KEY = "8ey4j8m7dsx8qtvpnrdhfwqn7p4gv579"
-THING_BUNDLE_ID = "com.nooie.home"
-
-THING_BIZ_DATA = json.dumps(
-    {
-        "miniappVersion": json.dumps(
-            {
-                "MapKit": "3.9.4",
-                "BizKit": "4.14.8",
-                "BaseKit": "3.18.6",
-                "container": "3.25.0",
-                "MiniKit": "3.15.3",
-                "DeviceKit": "4.13.6",
-                "basicLib": "",
-            },
-            separators=(",", ":"),
-        ),
-        "nd": 1,
-        "customDomainSupport": "1",
-    },
-    separators=(",", ":"),
-)
-
-# static sdk 5.7.10 identification, exactly as the ios build reports it.
-THING_SDK = {
-    "sdkVersion": "5.7.10",
-    "deviceCoreVersion": "5.18.0",
-    "appVersion": "3.7.0",
-    "appRnVersion": "5.92",
-    "channel": "sdk",
-    "os": "IOS",
-    "osSystem": "26.5",
-    "platform": "iPad8,6",
-    "lang": "en",
-    "timeZoneId": "Europe/London",
-    "ttid": "appstore_r",
-    "et": "0.0.2",
-    "nd": "1",
-    "cp": "gzip",
-    "lat": "0",
-    "lon": "0",
-    "bizData": THING_BIZ_DATA,
 }
 
 # --- apeman p2p control channel -------------------------------------------
