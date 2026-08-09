@@ -1,5 +1,6 @@
 .env*
 !.env.example
+/pypi_token
 experiments/
 .claude/
 .venv/

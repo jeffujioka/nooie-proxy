@@ -20,7 +20,7 @@ from aiortc import (
 from aiortc.mediastreams import MediaStreamError
 from aiortc.rtp import RtcpRrPacket
 
-from . import cloud, rtc, sdp, signalling
+from . import cloud, profile, rtc, sdp, signalling
 from .cloud import Config
 from .env import log
 
@@ -97,12 +97,15 @@ class Remux:
     of it before letting any of it go.
     """
 
-    def __init__(self, target: str) -> None:
+    def __init__(self, target: str, stopped: asyncio.Event) -> None:
         self.container = av.open(
             aligned(target), "w", format=MUXER, options=MUX
         )
         self.streams: dict[Any, Any] = {}
         self.pumps: list[asyncio.Task[None]] = []
+        # set when a track ends or the sink dies, so the call unwinds instead
+        # of streaming into nothing until something else kills the process.
+        self.stopped = stopped
 
     def add(self, track: Any) -> None:
         """declare a track, which every one must be before the first packet."""
@@ -134,11 +137,21 @@ class Remux:
         ]
 
     async def pump(self, track: Any, stream: Any) -> None:
-        with suppress(MediaStreamError):
+        """copy one track into the container until it ends or the sink dies."""
+        try:
             while True:
                 packet = await track.recv()
                 packet.stream = stream
                 self.container.mux(packet)
+        except MediaStreamError:
+            log(f"{track.kind} track ended")
+        except Exception as error:  # noqa: BLE001 — the sink is the boundary
+            # the reader hung up (go2rtc restarting, a closed pipe) or the url
+            # went away; whatever pyav raises, the call has to end, and without
+            # this the failure is swallowed and it spins on writing nowhere.
+            log(f"{track.kind} sink failed: {error}")
+        finally:
+            self.stopped.set()
 
     async def stop(self) -> None:
         for pump in self.pumps:
@@ -155,19 +168,26 @@ async def stream(config: Config, target: str) -> None:
         skip_auto_headers={"Accept", "Accept-Encoding", "User-Agent"},
     ) as http:
         log("connecting to Nooie signalling")
-        async with http.ws_connect(
-            cloud.WS_URL,
-            headers={
-                "uid": config.uid,
-                "appid": cloud.APP_ID,
-                "api_token": config.api_token,
-                "phone_code": config.phone_code,
-                "Origin": signalling.origin(cloud.WS_URL),
-            },
-            heartbeat=20,
-        ) as websocket:
-            session = await cloud.create_session(http, config)
-            await place_call(config, session, websocket, target)
+        try:
+            async with http.ws_connect(
+                profile.WS_URL,
+                headers={
+                    "uid": config.uid,
+                    "appid": profile.APP_ID,
+                    "api_token": config.api_token,
+                    "phone_code": config.phone_code,
+                    "Origin": signalling.origin(profile.WS_URL),
+                },
+                heartbeat=20,
+            ) as websocket:
+                session = await cloud.create_session(http, config)
+                await place_call(config, session, websocket, target)
+        except aiohttp.WSServerHandshakeError as error:
+            # this exception carries the request headers, api_token and all;
+            # re-raise with the status alone so no handler can print them.
+            raise RuntimeError(
+                f"Nooie signalling refused the connection: HTTP {error.status}"
+            ) from None
 
 
 async def place_call(
@@ -183,11 +203,11 @@ async def place_call(
             bundlePolicy=RTCBundlePolicy.MAX_BUNDLE,
         )
     )
-    sink = Remux(target)
-    origin = time.monotonic()
-    started: asyncio.Task[None] | None = None
     connected = asyncio.Event()
     stopped = asyncio.Event()
+    sink = Remux(target, stopped)
+    origin = time.monotonic()
+    started: asyncio.Task[None] | None = None
     loop = asyncio.get_running_loop()
     for number in (signal.SIGINT, signal.SIGTERM):
         # unwind rather than die, so the container is flushed and closed.
@@ -247,7 +267,7 @@ async def place_call(
             ret = int(data.get("Ret", 0))
             if ret != 0:
                 raise RuntimeError(f"camera rejected the call with Ret={ret}")
-            if data.get("WebrtcSdp"):
+            if data.get("WebrtcSdp") and peer.remoteDescription is None:
                 await peer.setRemoteDescription(
                     RTCSessionDescription(
                         sdp=sdp.expand_answer(str(data["WebrtcSdp"])),
@@ -255,7 +275,9 @@ async def place_call(
                     )
                 )
                 log("camera answered")
-                await asyncio.wait_for(connected.wait(), timeout=10)
+                # no waiting here: the loop below has to keep reading so the
+                # candidates the camera trickles after its answer still land,
+                # which is exactly the case a hard nat depends on.
         if not connected.is_set():
             raise RuntimeError(
                 f"no usable answer within {ANSWER_TIMEOUT} seconds"

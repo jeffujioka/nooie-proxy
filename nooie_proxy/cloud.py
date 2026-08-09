@@ -14,12 +14,7 @@ import aiohttp
 from aiortc import RTCIceServer
 
 from .env import country, credentials, identity, log
-
-API_BASE = "https://app.eu.nooie.com/v2"
-WS_URL = "wss://wss.eu.nooie.com/ws"
-APP_ID = "4adcd2139621b1ef"
-APP_SECRET = "9e03f0b14adcd2139621b1ef984b2ac0"
-USER_AGENT = "Nooie_IOS_3.7.0"
+from .profile import API_BASE, APP_ID, APP_SECRET, DEVICE, USER_AGENT
 
 
 @dataclass(frozen=True)
@@ -32,6 +27,10 @@ class Config:
     request_uuid: str
     device_id: str = ""
     model_id: str = ""
+
+    def __repr__(self) -> str:
+        # holds the api token: never let a traceback or a log line print it.
+        return "Config(<redacted>)"
 
 
 def utc_offset_hours() -> int:
@@ -69,7 +68,7 @@ def login_body(username: str, password: str, phone_code: str) -> dict[str, Any]:
         "account": username,
         "country": country(),
         "password": hashlib.md5(password.encode()).hexdigest(),
-        "phone_brand": "iPad Pro 12.9-in. 3rd gen",
+        "phone_brand": DEVICE["phone_brand"],
         "phone_code": phone_code,
         "zone": utc_offset_hours(),
     }
@@ -80,17 +79,17 @@ def registration_body(config: Config) -> dict[str, Any]:
     return {
         "phone_brand": "Apple",
         "zone": utc_offset_hours(),
-        "phone_version": "26.5",
-        "app_version": "3.7.0",
-        "phone_screen": "[1470, 956]",
-        "device_type": 2,
+        "phone_version": DEVICE["phone_version"],
+        "app_version": DEVICE["app_version"],
+        "phone_screen": DEVICE["phone_screen"],
+        "device_type": DEVICE["device_type"],
         "phone_code": config.phone_code,
-        "package_name": "com.nooie.home",
-        "language": "en",
-        "app_version_code": "11",
+        "package_name": DEVICE["package_name"],
+        "language": DEVICE["language"],
+        "app_version_code": DEVICE["app_version_code"],
         "country": country(),
-        "push_type": 3,
-        "phone_model": "iPad8,6",
+        "push_type": DEVICE["push_type"],
+        "phone_model": DEVICE["phone_model"],
     }
 
 

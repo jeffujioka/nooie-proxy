@@ -12,17 +12,26 @@ import hashlib
 import random
 import socket
 import struct
+from contextlib import suppress
 from dataclasses import dataclass
 
+from .profile import (
+    APEMAN_RPC_VERSION,
+    APEMAN_SALT,
+    POLICY_HOST,
+    POLICY_PORT,
+)
 from .twofish import Twofish
+
+# no apeman frame comes anywhere near this; it is here so a wrong length
+# prefix fails loudly instead of reading until memory runs out.
+MAX_FRAME = 1 << 16
 
 # --- crypto -----------------------------------------------------------------
 
 # each apeman rpc "sail" body is enciphered with twofish-256 in ecb mode over
 # 16-byte blocks with pkcs#7 padding. the 32-byte key is per-message (see
 # sail_key). the pure twofish impl is validated against the reference vectors.
-
-APEMAN_SALT = "ApEMaNSNoOiE"
 
 
 def sail_key(method: str, trans_id: int) -> bytes:
@@ -72,8 +81,6 @@ def block_decrypt(blob: bytes, key: bytes) -> bytes:
 # field9=rpc_type(=1), field11=enc(body), field14=0; the optional code/code_msg
 # (6,7) are response-only.
 
-RPC_VERSION = b"5.0.0"
-
 
 def _uv(n: int) -> bytes:
     """protobuf base-128 varint."""
@@ -97,39 +104,49 @@ def build_rpc(method: str, trans_id: int, body: bytes, rpc_type: int = 1) -> byt
     """frame one request: 4-byte BE total length + ReqHeader nanopb (twofish body
     in field 11). the length prefix counts itself (4 + len(header))."""
     enc = block_encrypt(body, sail_key(method, trans_id))
-    hdr = (_v(1, 23) + _s(3, RPC_VERSION) + _s(4, method.encode())
+    hdr = (_v(1, 23) + _s(3, APEMAN_RPC_VERSION) + _s(4, method.encode())
            + _v(5, trans_id) + _v(8, 1) + _v(9, rpc_type) + _s(11, enc)
            + _v(14, 0))
     return struct.pack(">I", 4 + len(hdr)) + hdr
 
 
+def _rv(buf: bytes, i: int) -> tuple[int, int]:
+    """read the base-128 varint at `i`; returns (value, index after it)."""
+    value = shift = 0
+    while i < len(buf):
+        byte = buf[i]
+        i += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, i
+        shift += 7
+    raise ValueError("truncated varint")
+
+
 def parse(buf: bytes) -> dict:
     """decode a flat protobuf into {tag: int | bytes} (last wins per tag). in a
     response ReqHeader: field4=method, field5=transId, field6=code, field11=body
-    (still enciphered; decrypt with sail_key(method, transId))."""
+    (still enciphered; decrypt with sail_key(method, transId)).
+
+    keys and lengths are varints, exactly as _uv writes them: reading either as
+    a single byte silently mangles any tag past 15 or field past 127 bytes. a
+    short or corrupt frame stops the walk rather than raising, so a caller sees
+    a missing field instead of an IndexError out of the network path."""
     i, out = 0, {}
-    while i < len(buf):
-        key = buf[i]
-        i += 1
-        tag, wt = key >> 3, key & 7
-        if wt == 0:
-            v = 0
-            s = 0
-            while True:
-                b = buf[i]
-                i += 1
-                v |= (b & 0x7F) << s
-                s += 7
-                if not b & 0x80:
+    with suppress(ValueError):
+        while i < len(buf):
+            key, i = _rv(buf, i)
+            tag, wt = key >> 3, key & 7
+            if wt == 0:
+                out[tag], i = _rv(buf, i)
+            elif wt == 2:
+                n, i = _rv(buf, i)
+                if i + n > len(buf):
                     break
-            out[tag] = v
-        elif wt == 2:
-            n = buf[i]
-            i += 1
-            out[tag] = buf[i : i + n]
-            i += n
-        else:
-            break
+                out[tag] = buf[i : i + n]
+                i += n
+            else:
+                break
     return out
 
 
@@ -175,8 +192,6 @@ def decode_response(frame: bytes) -> tuple[str, int, dict]:
 
 # server discovery hits the policy host on tcp 9000 and returns the region's nat
 # servers; natcheck then runs against those (udp :5083/:5084).
-POLICY_HOST = "policy-eu.nooie.com"
-POLICY_PORT = 9000
 
 
 # --- natcheck registration orchestrator -------------------------------------
@@ -206,12 +221,20 @@ def _tcp_rpc(host: str, port: int, method: str, body: bytes,
              timeout: float = 6.0) -> tuple[str, int, dict]:
     with socket.create_connection((host, port), timeout) as s:
         s.sendall(build_rpc(method, _tid(), body))
-        buf = b""
-        while len(buf) < 4 or len(buf) < struct.unpack(">I", buf[:4])[0]:
+        buf, size = b"", MAX_FRAME
+        while len(buf) < size:
             chunk = s.recv(4096)
             if not chunk:
                 break
             buf += chunk
+            if len(buf) >= 4:
+                # the server declares the length; believe it only within
+                # reason, or a wrong four bytes reads until memory runs out.
+                size = struct.unpack(">I", buf[:4])[0]
+                if not 4 < size <= MAX_FRAME:
+                    raise RuntimeError(f"apeman {method}: bad frame length")
+    if len(buf) < size:
+        raise RuntimeError(f"apeman {method}: truncated response")
     return decode_response(buf)
 
 

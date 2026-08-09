@@ -20,7 +20,11 @@ async def serve() -> None:
             # publish our nat mapping on nooie's p2p network so the camera
             # can reach us; the registration holds its udp socket open.
             registration = await asyncio.to_thread(apeman.register, config.uid)
-            log(f"p2p registered from {registration.wan_ip}")
+            # enough of the mapping to tell a nat problem apart from a working
+            # one, without putting the user's public address in a log they may
+            # well paste into an issue.
+            masked = registration.wan_ip.rsplit(".", 1)[0] + ".x"
+            log(f"p2p registered from {masked}")
             await stream(config, target)
 
 

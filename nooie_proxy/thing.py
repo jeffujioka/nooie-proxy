@@ -28,9 +28,15 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from .env import canonical_uuid, country, credentials, identity, log
-
-API_URL = "https://a1.tuyaeu.com/api.json"
-USER_AGENT = "Nooie_IOS_3.7.0"
+from .profile import (
+    THING_API_URL,
+    THING_APP_KEY,
+    THING_APP_SECRET,
+    THING_BUNDLE_ID,
+    THING_PICTURE_KEY,
+    THING_SDK,
+    USER_AGENT,
+)
 
 # the parameters the sdk feeds into the request signature; everything else it
 # sends is metadata the server echoes back unverified.
@@ -38,46 +44,6 @@ SIGNED_FIELDS = frozenset(
     "a v lat lon et lang deviceId imei imsi appVersion ttid isH5 h5Token os "
     "clientId postData time n4h5 sid sp requestId".split()
 )
-
-# static sdk 5.7.10 identification, exactly as the ios build reports it.
-BIZ_DATA = json.dumps(
-    {
-        "miniappVersion": json.dumps(
-            {
-                "MapKit": "3.9.4",
-                "BizKit": "4.14.8",
-                "BaseKit": "3.18.6",
-                "container": "3.25.0",
-                "MiniKit": "3.15.3",
-                "DeviceKit": "4.13.6",
-                "basicLib": "",
-            },
-            separators=(",", ":"),
-        ),
-        "nd": 1,
-        "customDomainSupport": "1",
-    },
-    separators=(",", ":"),
-)
-SDK = {
-    "sdkVersion": "5.7.10",
-    "deviceCoreVersion": "5.18.0",
-    "appVersion": "3.7.0",
-    "appRnVersion": "5.92",
-    "channel": "sdk",
-    "os": "IOS",
-    "osSystem": "26.5",
-    "platform": "iPad8,6",
-    "lang": "en",
-    "timeZoneId": "Europe/London",
-    "ttid": "appstore_r",
-    "et": "0.0.2",
-    "nd": "1",
-    "cp": "gzip",
-    "lat": "0",
-    "lon": "0",
-    "bizData": BIZ_DATA,
-}
 
 
 class ThingError(RuntimeError):
@@ -88,10 +54,10 @@ class ThingError(RuntimeError):
 class ThingApp:
     """the credentials nooie ships inside its app bundle."""
 
-    app_key: str = "kvradrme9pmyjckdd7ws"
-    app_secret: str = "jmaj939wk95awxur9xe7trgpwnyddpu8"
-    secret_pic_key: str = "8ey4j8m7dsx8qtvpnrdhfwqn7p4gv579"
-    bundle_id: str = "com.nooie.home"
+    app_key: str = THING_APP_KEY
+    app_secret: str = THING_APP_SECRET
+    secret_pic_key: str = THING_PICTURE_KEY
+    bundle_id: str = THING_BUNDLE_ID
 
     @property
     def key_material(self) -> str:
@@ -107,6 +73,10 @@ class ThingSession:
     uid: str
     partner_identity: str
     domain: Mapping[str, Any]
+
+    def __repr__(self) -> str:
+        # sid and ecode are session secrets; keep them out of tracebacks.
+        return "ThingSession(<redacted>)"
 
     @classmethod
     def from_result(cls, result: Mapping[str, Any]) -> ThingSession:
@@ -231,7 +201,7 @@ def build_request_params(
     timestamp: int,
     sid: str = "",
 ) -> dict[str, str]:
-    params = SDK | {
+    params = THING_SDK | {
         "a": action,
         "v": version,
         "time": str(timestamp),
@@ -319,7 +289,7 @@ class ThingClient:
         )
         try:
             async with http.post(
-                API_URL,
+                THING_API_URL,
                 headers={
                     "Accept": "*/*",
                     "Content-Type": "application/x-www-form-urlencoded",

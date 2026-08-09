@@ -66,13 +66,21 @@ def canonical_uuid(value: str) -> str:
 
 
 def identity() -> str:
-    """one stable uuid naming this install to both nooie and thing."""
+    """one stable uuid naming this install to both nooie and thing.
+
+    written through a temporary file: a run killed mid-write would otherwise
+    leave an empty identity behind, and every later run would then die on it.
+    """
     path = state_dir() / "identity"
-    if not path.exists():
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with suppress(FileExistsError):
-            path.touch(mode=0o600, exist_ok=False)
-            path.write_text(str(uuid.uuid4()).upper() + "\n")
+    # not canonical_uuid: a missing or unusable file is a reason to write a
+    # new one, not to exit.
+    with suppress(OSError, ValueError):
+        return str(uuid.UUID(path.read_text().strip())).upper()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fresh = path.with_name(f"identity.{os.getpid()}")
+    fresh.touch(mode=0o600)
+    fresh.write_text(str(uuid.uuid4()).upper() + "\n")
+    os.replace(fresh, path)
     return canonical_uuid(path.read_text())
 
 
