@@ -250,7 +250,14 @@ async def place_call(
 
         deadline = time.monotonic() + ANSWER_TIMEOUT
         while not connected.is_set() and time.monotonic() < deadline:
-            message = await receive(websocket, deadline - time.monotonic())
+            # poll in short steps. the loop has to keep reading, so that the
+            # candidates the camera trickles after its answer still land, but
+            # it also has to see `connected` at once: waiting out the whole
+            # deadline here holds back the switch and the keyframe for the
+            # rest of it, and the camera gives up on a call left that long.
+            message = await receive(
+                websocket, min(1.0, deadline - time.monotonic())
+            )
             if message is False:
                 raise RuntimeError("signalling closed during the handshake")
             found = signalling.matching_signal(
