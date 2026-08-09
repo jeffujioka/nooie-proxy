@@ -43,7 +43,7 @@ value in the file.
 | variable | default | meaning |
 | --- | --- | --- |
 | `NOOIE_USERNAME`, `NOOIE_PASSWORD` | — | the account login |
-| `NOOIE_COUNTRY_CODE` | `44` | the account region |
+| `NOOIE_COUNTRY_CODE` | `44` | your mobile phone's country code |
 | `NOOIE_DEVICE_ID` | — | the camera to use when the account has more than one |
 | `NOOIE_OUTPUT` | `-` | `-` for stdout, or any path or URL that PyAV writes |
 
