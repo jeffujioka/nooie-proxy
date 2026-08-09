@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nooie-proxy"
-version = "0.3.0"
+version = "0.1.0"
 description = "A live MPEG-TS stream from your own Nooie IP camera"
 readme = "README.md"
 requires-python = ">=3.11"
