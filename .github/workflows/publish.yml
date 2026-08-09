@@ -16,7 +16,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v9
       - name: Build and publish to PyPI
-        run: uv build && uv publish
+        # `always` rather than the default `automatic`: this must fail loudly
+        # if the oidc handshake does not work, not fall back to looking for a
+        # token that is deliberately not here.
+        run: uv build && uv publish --trusted-publishing always
       - name: GitHub release
         uses: softprops/action-gh-release@v2
         with:
