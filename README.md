@@ -10,18 +10,24 @@ NOOIE_OUTPUT=udp://127.0.0.1:5004 nooie-proxy &  # serve it to other tools
 ffmpeg -i udp://127.0.0.1:5004 frame%04d.jpg     # attach and detach freely
 ```
 
-This directory is the standalone CLI and Python package. The repository
-around it is a Home Assistant add-on and component that run this proxy
-alongside go2rtc; see [../README.md](../README.md) if that's what you're
-after.
+Want this inside Home Assistant instead?
+[hass-nooie](https://github.com/ltrgoddard/hass-nooie) is an add-on and
+component that run this proxy alongside go2rtc and turn each camera into a
+camera entity.
 
 ## Install
 
-Python 3.11+ and [uv](https://docs.astral.sh/uv/):
+Python 3.11+:
 
 ```sh
-git clone https://github.com/ltrgoddard/hass-nooie.git
-cd nooie-proxy/proxy
+uv tool install nooie-proxy      # or: pipx install nooie-proxy
+```
+
+From a checkout, with [uv](https://docs.astral.sh/uv/):
+
+```sh
+git clone https://github.com/ltrgoddard/nooie-proxy.git
+cd nooie-proxy
 uv tool install --editable .
 ```
 
@@ -72,6 +78,7 @@ Three independent handshakes precede each call; each has a module.
 | `rtc` | aiortc patches: AAC, passthrough, RSA DTLS at 1200 bytes, ICE sizes |
 | `stream` | places the call and muxes the tracks |
 | `env` | dotenv, install identity, credentials |
+| `profile` | the app build this impersonates: endpoints and fingerprint |
 
 Media is muxed as it arrives, so the proxy costs a few percent of one core.
 Intended for accounts and cameras you own.
