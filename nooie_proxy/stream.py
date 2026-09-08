@@ -3,6 +3,7 @@
 import asyncio
 import fractions
 import json
+import os
 import signal
 import time
 from contextlib import suppress
@@ -20,7 +21,7 @@ from aiortc import (
 from aiortc.mediastreams import MediaStreamError
 from aiortc.rtp import RtcpRrPacket
 
-from . import cloud, profile, rtc, sdp, signalling
+from . import cloud, codec as session_codec, profile, rtc, sdp, signalling
 from .cloud import Config
 from .env import log
 
@@ -135,7 +136,8 @@ class Remux:
     def video(self) -> Any:
         # a mux stream builds no codec context at all, so the muxer reads
         # the camera's parameter sets out of the stream where they belong.
-        return self.container.add_mux_stream("h264", time_base=BASE["video"])
+        self._video_codec_name = "hevc" if session_codec.video_codec() == "h265" else "h264"
+        return self.container.add_mux_stream(self._video_codec_name, time_base=BASE["video"])
 
     def audio(self) -> Any:
         # aac has to be declared the long way: the muxer can only frame it
@@ -295,9 +297,16 @@ async def place_call(
             if ret != 0:
                 raise RuntimeError(f"camera rejected the call with Ret={ret}")
             if data.get("WebrtcSdp") and peer.remoteDescription is None:
+                answer = str(data["WebrtcSdp"])
+                chosen = session_codec.select_codec(
+                    sdp.answer_video_pt(answer),
+                    os.environ.get("NOOIE_VIDEO_CODEC"),
+                )
+                session_codec.set_video_codec(chosen)
+                log(f"video codec: {chosen}")
                 await peer.setRemoteDescription(
                     RTCSessionDescription(
-                        sdp=sdp.expand_answer(str(data["WebrtcSdp"])),
+                        sdp=sdp.expand_answer(answer),
                         type="answer",
                     )
                 )

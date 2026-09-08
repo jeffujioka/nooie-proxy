@@ -39,6 +39,16 @@ def video_ssrc(sdp: str) -> int | None:
     return None
 
 
+def answer_video_pt(value: str) -> int | None:
+    """the video payload type announced in a compact answer, if any."""
+    if not value.startswith("00\r\n"):
+        return None
+    try:
+        return int(json.loads(value[4:])["video"]["pt"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+
 def local_candidates(sdp: str) -> list[LocalIceCandidate]:
     """usable ipv4 candidates worth trickling, loopback and mdns excluded."""
     chosen: list[LocalIceCandidate] = []
