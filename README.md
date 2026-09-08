@@ -1,5 +1,11 @@
 # nooie-proxy
 
+> **Fork** (`jeffujioka/nooie-proxy`, branch `fix-h265`): adds h.265/RFC 7798
+> support and adopts static payload types (IPC100C and friends), plus a
+> `--diagnose` subcommand and a stall watchdog. Install by immutable tag:
+> `pip install "nooie-proxy @ git+https://github.com/jeffujioka/nooie-proxy@v0.2.0-h265.1"`.
+> See `docs/debugging.md`. Upstream: ltrgoddard/nooie-proxy.
+
 Your own Nooie IP camera has a WebRTC path but no RTSP output. nooie-proxy
 uses that path to stream live H.264 and AAC, without the official app. The
 proxy signs in, places the call, and muxes the result to stdout or to a URL.
