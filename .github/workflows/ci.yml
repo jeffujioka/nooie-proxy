@@ -1,17 +1,12 @@
 name: ci
-
 on:
-  push:
-    branches: [main]
+  push: { branches: [fix-h265] }
   pull_request:
-
 jobs:
-  check:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v9.0.0
-      - name: Lint
-        run: uvx ruff check .
-      - name: Tests
-        run: uv run python -m unittest discover -s tests -v
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync
+      - run: uv run pytest -q

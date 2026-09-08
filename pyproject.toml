@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nooie-proxy"
-version = "0.2.0"
+version = "0.2.0+h265.1"
 description = "A live MPEG-TS stream from your own Nooie IP camera"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -13,7 +13,7 @@ keywords = ["nooie", "camera", "webrtc", "home-assistant", "go2rtc"]
 authors = [{ name = "Louis Goddard", email = "louisgoddard@gmail.com" }]
 dependencies = [
     "aiohttp>=3.12,<4",
-    "aiortc>=1.14,<2",
+    "aiortc>=1.15,<1.16",
     # add_mux_stream, which stream.py needs, arrived in 17.0.0.
     "av>=17,<18",
     "cryptography>=45,<50",
@@ -29,3 +29,6 @@ Issues = "https://github.com/ltrgoddard/nooie-proxy/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["nooie_proxy"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
