@@ -56,6 +56,28 @@ def aligned(target: str) -> str:
     return f"{target}{'&' if '?' in target else '?'}pkt_size={7 * 188}"
 
 
+STALL_REASON = "the call carried no video for 30 s"
+
+
+class Stallwatch:
+    """flags a call that stays connected but stops carrying video.
+
+    the spike met this shape: the camera answers, connects, and sends
+    nothing. the supervisor can only rearm what exits, so a stalled call
+    has to become a nonzero exit rather than an idle process.
+    """
+
+    def __init__(self, timeout: float = 30.0) -> None:
+        self.timeout = timeout
+        self.last: float | None = None
+
+    def feed(self, now: float) -> None:
+        self.last = now
+
+    def stalled(self, now: float) -> bool:
+        return self.last is not None and now - self.last > self.timeout
+
+
 class Ending:
     """the end of the call: the wait for it, and the first reason given.
 
@@ -126,6 +148,7 @@ class Remux:
         # set when a track ends or the sink dies, so the call unwinds instead
         # of streaming into nothing until something else kills the process.
         self.ending = ending
+        self.watch: Stallwatch | None = None
 
     def add(self, track: Any) -> None:
         """declare a track, which every one must be before the first packet."""
@@ -164,6 +187,8 @@ class Remux:
                 packet = await track.recv()
                 packet.stream = stream
                 self.container.mux(packet)
+                if track.kind == "video" and self.watch is not None:
+                    self.watch.feed(time.monotonic())
         except MediaStreamError:
             self.ending.set(f"the camera stopped sending {track.kind}")
         except Exception as error:  # noqa: BLE001 — the sink is the boundary
@@ -323,8 +348,13 @@ async def place_call(
         await receive(websocket, 2)
         await request_keyframe(peer)
         streaming = time.monotonic()
+        sink.watch = Stallwatch()
+        sink.watch.feed(streaming)
         log(f"streaming to {target}")
         while not ending.is_set():
+            if sink.watch is not None and sink.watch.stalled(time.monotonic()):
+                ending.set(STALL_REASON)
+                break
             message = await receive(websocket, 1)
             if message is False:
                 ending.set("Nooie closed the signalling websocket")
@@ -353,6 +383,9 @@ async def place_call(
                 f"call ended after {time.monotonic() - streaming:.0f} s of "
                 f"streaming: {ending.why or 'an unknown cause'}"
             )
+    if ending.why == STALL_REASON:
+        # a stalled call must end in a nonzero exit so a supervisor rearms.
+        raise RuntimeError(STALL_REASON)
 
 
 async def receive(
