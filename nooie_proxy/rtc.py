@@ -15,6 +15,9 @@ import aioice.ice
 import aiortc.codecs
 import aiortc.rtcpeerconnection
 import aiortc.rtcrtpreceiver
+
+from . import codec as session_codec
+from . import h265
 from aiortc import RTCPeerConnection, RTCRtpSender
 from aiortc.codecs.base import Decoder
 from aiortc.jitterbuffer import JitterFrame
@@ -87,7 +90,12 @@ class Verbatim(Decoder):
         packet.update(data)
         packet.pts = packet.dts = encoded_frame.timestamp
         packet.time_base = self.time_base
-        packet.is_keyframe = self.audio or opens_a_group(data)
+        opener = (
+            h265.opens_a_group
+            if session_codec.video_codec() == "h265"
+            else opens_a_group
+        )
+        packet.is_keyframe = self.audio or opener(data)
         return [packet]
 
 
@@ -189,6 +197,32 @@ def _enable_nooie_ice_credentials() -> None:
     aioice.ice.random_string = random_string
 
 
+def _enable_h265_depacketization() -> None:
+    """route video payloads through rfc 7798 when the camera sends h.265.
+
+    the answer still says h264 (nooie's dialect names no codec; see
+    codec.select_codec), so the depacketizer is chosen by the session codec
+    rather than by the negotiated mime type. audio and genuine h.264 video
+    pass through stock aiortc untouched.
+    """
+    original = aiortc.codecs.depayload
+    if getattr(original, "_nooie_h265", False):
+        return
+
+    def depayload(params, payload):  # type: ignore[no-untyped-def]
+        if (
+            params.mimeType.lower() == "video/h264"
+            and session_codec.video_codec() == "h265"
+        ):
+            return h265.h265_depayload(payload)
+        return original(params, payload)
+
+    depayload._nooie_h265 = True  # type: ignore[attr-defined]
+    aiortc.codecs.depayload = depayload
+    # rtcrtpreceiver imported the symbol at module load; patch that copy too.
+    aiortc.rtcrtpreceiver.depayload = depayload
+
+
 def _adopt_remote_payload_types() -> None:
     """nooie's h.265 cameras announce video on the static payload type 0.
 
@@ -236,6 +270,7 @@ def patch() -> None:
     _enable_rsa_dtls()
     _enable_nooie_ice_credentials()
     _adopt_remote_payload_types()
+    _enable_h265_depacketization()
 
 
 def receive_only(peer: RTCPeerConnection) -> None:
