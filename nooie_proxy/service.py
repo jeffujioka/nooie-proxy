@@ -53,6 +53,10 @@ def main(argv: list[str] | None = None) -> None:
     try:
         if "--list-devices" in argv:
             asyncio.run(list_devices())
+        elif "--diagnose" in argv:
+            from . import diagnose
+
+            asyncio.run(diagnose.run(argv))
         else:
             asyncio.run(serve())
     except (RuntimeError, OSError, aiohttp.ClientError) as error:
