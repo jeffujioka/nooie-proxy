@@ -5,6 +5,7 @@ no codec for, only accepts rsa dtls certificates at a 1200-byte mtu, and its
 ice password is 24 characters rather than 22.
 """
 
+import copy
 import fractions
 import os
 from datetime import UTC, datetime, timedelta
@@ -12,6 +13,7 @@ from typing import Any
 
 import aioice.ice
 import aiortc.codecs
+import aiortc.rtcpeerconnection
 import aiortc.rtcrtpreceiver
 from aiortc import RTCPeerConnection, RTCRtpSender
 from aiortc.codecs.base import Decoder
@@ -187,11 +189,53 @@ def _enable_nooie_ice_credentials() -> None:
     aioice.ice.random_string = random_string
 
 
+def _adopt_remote_payload_types() -> None:
+    """nooie's h.265 cameras announce video on the static payload type 0.
+
+    stock find_common_codecs only adopts a remote payload type from the
+    dynamic range, so the receiver would register pt 126 while the camera
+    sends pt 0, and the rtp router would drop every video packet. this peer
+    only ever speaks to the camera, so adopt the remote type as announced.
+    """
+    module = aiortc.rtcpeerconnection
+    if getattr(module.find_common_codecs, "_nooie_adopts_static", False):
+        return
+    is_codec_compatible = module.is_codec_compatible
+    is_rtx = module.is_rtx
+
+    def find_common_codecs(local_codecs, remote_codecs):  # type: ignore[no-untyped-def]
+        common = []
+        common_base = {}
+        for c in remote_codecs:
+            if is_rtx(c):
+                apt = c.parameters.get("apt")
+                if isinstance(apt, int) and apt in common_base:
+                    base = common_base[apt]
+                    if c.clockRate == base.clockRate:
+                        common.append(copy.deepcopy(c))
+                continue
+            for codec in local_codecs:
+                if is_codec_compatible(codec, c):
+                    codec = copy.deepcopy(codec)
+                    codec.payloadType = c.payloadType
+                    codec.rtcpFeedback = list(
+                        filter(lambda x: x in c.rtcpFeedback, codec.rtcpFeedback)
+                    )
+                    common.append(codec)
+                    common_base[codec.payloadType] = codec
+                    break
+        return common
+
+    find_common_codecs._nooie_adopts_static = True  # type: ignore[attr-defined]
+    module.find_common_codecs = find_common_codecs
+
+
 def patch() -> None:
     _enable_aac()
     _pass_media_through()
     _enable_rsa_dtls()
     _enable_nooie_ice_credentials()
+    _adopt_remote_payload_types()
 
 
 def receive_only(peer: RTCPeerConnection) -> None:
